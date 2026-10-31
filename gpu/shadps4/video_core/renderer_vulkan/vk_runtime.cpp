@@ -1408,10 +1408,36 @@ void Runtime::FlushBarriers() {
     const bool in_pass = scheduler.IsRendering() &&
                          (memory_barrier.srcStageMask || !image_barriers.empty());
 #if BB_METAL_BACKEND
-    const bool keep_pass = in_pass && MetalLayer::FrameEnabled() && image_barriers.empty() &&
+    // Experiment bit 7 (MetalImageBarrierInPass): image barriers too, when none is on an image
+    // the open pass renders into (layouts mean nothing to Metal; sampling one of its attachments
+    // needs the pass stored first).
+    bool on_attachments = false;
+    if (in_pass && !image_barriers.empty()) {
+        const RenderState& state = scheduler.GetRenderState();
+        std::array<VkImage, 9> images{};
+        u32 n = 0;
+        for (u32 i = 0; i < state.num_color_attachments; ++i) {
+            images[n++] = VkImage(MetalLayer::ImageOfView(state.color_attachments[i].image_view));
+        }
+        if (state.depth_stencil_attachment.image_view) {
+            images[n++] = VkImage(MetalLayer::ImageOfView(state.depth_stencil_attachment.image_view));
+        }
+        for (const auto& barrier : image_barriers) {
+            const VkImage image = static_cast<VkImage>(barrier.image);
+            for (u32 i = 0; i < n; ++i) {
+                // An attachment whose image is not known counts as this image.
+                on_attachments |= !images[i] || images[i] == image;
+            }
+        }
+    }
+    const bool images_ok = image_barriers.empty() ||
+                           (!on_attachments && BbToggle::Experiment(1ull << 7));
+    const bool keep_pass = in_pass && MetalLayer::FrameEnabled() && images_ok &&
                            !graphics_write && BbToggle::Experiment(1ull << 5);
     if (in_pass && MetalLayer::PassStats()) {
-        MetalLayer::NoteBarrierInPass(!image_barriers.empty() ? 0 : graphics_write ? 1 : 2,
+        MetalLayer::NoteBarrierInPass(image_barriers.empty() ? (graphics_write ? 1 : 2)
+                                      : on_attachments       ? 0
+                                                             : 3,
                                       keep_pass);
     }
 #else

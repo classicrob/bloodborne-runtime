@@ -193,10 +193,12 @@ void Report() {
             std::printf("Metal passes per frame (%.1f FPS): %.1f render passes (%.1f without "
                         "draws or clears, %.1f clears only); encoders: %.1f render (%.1f reopened "
                         "after tessellation or geometry kernels), %.1f compute, %.1f blit; %.1f "
-                        "tessellation runs, %.1f geometry-shader draws\n",
+                        "tessellation runs, %.1f geometry-shader draws; plus %.1f render encoders "
+                        "of image clears, %.1f of image blits\n",
                         f / seconds, x(s.passes), x(s.passes_empty), x(s.passes_clear_only),
                         x(s.render_encoders), x(s.render_reopened), x(s.compute_encoders),
-                        x(s.blit_encoders), x(s.tess_runs), x(s.geometry_draws));
+                        x(s.blit_encoders), x(s.tess_runs), x(s.geometry_draws),
+                        x(s.clear_encoders), x(s.blit_image_encoders));
             const char* kinds[3] = {"colour", "depth", "stencil"};
             for (int k = 0; k < 3; ++k) {
                 std::printf("Metal passes per frame: %s attachments load %.1f, clear %.1f, "
@@ -204,10 +206,11 @@ void Report() {
                             kinds[k], x(s.loads[k][0]), x(s.loads[k][1]), x(s.loads[k][2]),
                             x(s.stores[k][0]), x(s.stores[k][1]));
             }
-            std::printf("Metal passes per frame: barriers in an open pass: %.1f with image barriers, "
-                        "%.1f after graphics-stage writes, %.1f other; %.1f kept the pass open\n",
-                        x(s.barrier_images), x(s.barrier_graphics_write), x(s.barrier_other),
-                        x(s.barrier_kept));
+            std::printf("Metal passes per frame: barriers in an open pass: %.1f with image barriers "
+                        "on its attachments, %.1f with image barriers on other images only, %.1f "
+                        "after graphics-stage writes, %.1f other; %.1f kept the pass open\n",
+                        x(s.barrier_images), x(s.barrier_images_off_pass),
+                        x(s.barrier_graphics_write), x(s.barrier_other), x(s.barrier_kept));
             std::printf("Metal passes per frame: attachments loaded %.1f MB (%.1f MB by reopened "
                         "passes), stored %.1f MB\n",
                         x(s.load_bytes) / 1e6, x(s.reopen_load_bytes) / 1e6,
@@ -465,6 +468,7 @@ void CommitOwned(uint32_t count, Get&& get, const std::vector<EventSignal>* sign
             }
             CompleteFence(o->cmd, fence);
         }
+        MetalFrame::PassDumpCommit(*o);
         MetalFrame::ReturnScratchWhenDone(*o);
         if (!o->keep.empty()) {
             // Our temporary buffers live until the GPU is done with them.
@@ -1214,9 +1218,16 @@ bool PassStats() {
     return MetalFrame::PassStats();
 }
 
+unsigned long long ImageOfView(unsigned long long view) {
+    return (unsigned long long)MetalFrame::ImageOfView(VkImageView(view));
+}
+
 void NoteBarrierInPass(int kind, bool kept) {
     auto& s = MetalFrame::GetStats();
-    ++(kind == 0 ? s.barrier_images : kind == 1 ? s.barrier_graphics_write : s.barrier_other);
+    ++(kind == 0   ? s.barrier_images
+       : kind == 3 ? s.barrier_images_off_pass
+       : kind == 1 ? s.barrier_graphics_write
+                   : s.barrier_other);
     s.barrier_kept += kept;
 }
 

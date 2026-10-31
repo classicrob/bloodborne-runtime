@@ -37,6 +37,8 @@ bool PassStats();
 /// A barrier flushed in an open render pass (`kind`: 0 image barriers, 1 after a graphics-stage
 /// write, 2 other); `kept`: the pass stayed open.
 void NoteBarrierInPass(int kind, bool kept);
+/// The image of an image view the Metal frame knows (as u64; 0: not known).
+unsigned long long ImageOfView(unsigned long long view);
 
 /// The Metal encoding state of an owned command buffer (a VkCommandBuffer), or null: for the
 /// render adapter's Metal recorder (mtl_recorder.mm), which encodes without Vulkan calls.

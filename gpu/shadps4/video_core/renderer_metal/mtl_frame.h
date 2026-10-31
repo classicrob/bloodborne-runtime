@@ -16,6 +16,7 @@
 #include <atomic>
 #include <memory>
 #include <unordered_map>
+#include <string>
 #include <vector>
 #include "video_core/renderer_vulkan/vk_common.h"
 // Metal export types (this directory builds without VK_USE_PLATFORM_METAL_EXT).
@@ -80,6 +81,11 @@ struct Owned {
     id<MTLComputeCommandEncoder> compute;
     id<MTLBlitCommandEncoder> blit;
     unsigned commands{};
+    // BB_METAL_PASS_DUMP: this command buffer's encoders, one line each, while a dump records.
+    std::vector<std::string> dump;
+    u32 dump_count{};                ///< draws, dispatches or blit commands of the open encoder
+    std::vector<void*> dump_reads;   ///< textures it bound (sampled, read or copied from)
+    std::vector<void*> dump_writes;  ///< textures a blit wrote
     MetalGpuTiming::Command* timing{}; ///< BB_METAL_GPU_TIMING: this command buffer's samples
 
     // Render pass (vkCmdBeginRendering .. vkCmdEndRendering). `pass` reopens it (loading, not
@@ -256,10 +262,18 @@ struct Stats {
         load_bytes{}, store_bytes{}, reopen_load_bytes{}, ///< estimated attachment traffic
         // Barriers flushed in an open pass (Vulkan::Runtime::FlushBarriers), by what they wait for;
         // kept: the pass stayed open (experiment MetalBarrierInPass).
-        barrier_images{}, barrier_graphics_write{}, barrier_other{}, barrier_kept{};
+        barrier_images{}, barrier_graphics_write{}, barrier_other{}, barrier_kept{},
+        clear_encoders{}, blit_image_encoders{}, barrier_images_off_pass{}; ///< render encoders of image clears and blits
 };
 /// BB_METAL_PASS_STATS=1 (diagnostics, off by default).
 bool PassStats();
+/// BB_METAL_PASS_DUMP=<file> (diagnostics): `<file>.trigger` existing at a present makes the command
+/// buffers committed until the next present append their encoders to <file> (then the trigger goes).
+bool PassDumpRecording();
+void PassDumpPresent();
+void PassDumpCommit(Owned& o);
 Stats& GetStats();
+/// The image of a view (VK_NULL_HANDLE: not known).
+VkImage ImageOfView(VkImageView view);
 
 } // namespace MetalFrame
