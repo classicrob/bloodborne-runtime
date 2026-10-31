@@ -57,6 +57,11 @@ struct Profile {
     bool supports_shader_stencil_export{};
     /// bbport BB_LAYER_MEMORY: guest buffers of IsPagedBuffer size go through the page table.
     bool paged_buffers{};
+    /// bbport (Metal, BB_MSL_CONSTANT_BUFFERS=1): buffers read only by scalar constant reads are
+    /// uniform blocks, which SPIRV-Cross declares in Metal's constant address space; graphics
+    /// stages, and compute too with BB_MSL_CONSTANT_BUFFERS=2.
+    bool uniform_const_buffers{};
+    bool uniform_const_buffers_compute{};
     /// bbport: the game's buffer copy compute shader (its GCN program hash, from the game's profile;
     /// 0 = none): its paged stores go through to the game's memory as well.
     u64 buffer_copy_shader_hash{};

@@ -827,6 +827,15 @@ Shader::Profile BackendDevice::ShaderProfile() const {
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance.IsShaderStencilExportSupported(),
+        // bbport: Metal only (stage_bindings is set for the Metal frame alone); experiment.
+        .uniform_const_buffers = [&] {
+            const char* env = std::getenv("BB_MSL_CONSTANT_BUFFERS");
+            return GetCapabilities().stage_bindings && env && (env[0] == '1' || env[0] == '2');
+        }(),
+        .uniform_const_buffers_compute = [&] {
+            const char* env = std::getenv("BB_MSL_CONSTANT_BUFFERS");
+            return GetCapabilities().stage_bindings && env && env[0] == '2';
+        }(),
     };
 }
 

@@ -18,7 +18,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 24u; // Metal: no buffer offset table, each stage's bindings from its own base
-static constexpr u32 ShaderMetaVersion = 9u; // fixed quad local output map in InfoPersistent
+static constexpr u32 ShaderMetaVersion = 10u; // 10: BufferResource::scalar_reads_only // 9: fixed quad local output map in InfoPersistent
 static constexpr u32 PipelineKeyVersion = 6u; // fixed quad vertex pipeline key
 } // namespace Serialization
 

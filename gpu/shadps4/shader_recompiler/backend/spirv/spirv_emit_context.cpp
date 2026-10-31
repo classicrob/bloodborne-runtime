@@ -839,7 +839,8 @@ void EmitContext::DefinePushDataBlock() {
 }
 
 EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_coherent, u32 elem_shift,
-                                                 BufferType buffer_type, Id data_type) {
+                                                 BufferType buffer_type, Id data_type,
+                                                 bool uniform) {
     // Define array type.
     const Id record_array_type{TypeRuntimeArray(data_type)};
     // Define block struct type. Don't perform decorations twice on the same Id.
@@ -852,8 +853,11 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
         MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
         buf_type_ids.push_back(record_array_type);
     }
-    // Define buffer binding interface.
-    constexpr auto storage_class = spv::StorageClass::StorageBuffer;
+    // Define buffer binding interface. bbport: a uniform block (Profile::uniform_const_buffers)
+    // keeps the runtime array: only SPIRV-Cross reads this SPIR-V, and it declares both the same
+    // way, in the constant address space instead of the device one.
+    const auto storage_class =
+        uniform ? spv::StorageClass::Uniform : spv::StorageClass::StorageBuffer;
     const Id struct_pointer_type{TypePointer(storage_class, struct_type)};
     const Id pointer_type = TypePointer(storage_class, data_type);
     const Id id{AddGlobalVariable(struct_pointer_type, storage_class)};
@@ -926,8 +930,15 @@ void EmitContext::DefineBuffers() {
                 DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);
         }
         if (True(desc.used_types & IR::Type::U32)) {
+            // bbport: read only by scalar constant reads, so with the same index in every
+            // invocation: Metal can keep such data in uniform registers.
+            const bool uniform = (sw_stage == SwStage::Compute
+                                      ? profile.uniform_const_buffers_compute
+                                      : profile.uniform_const_buffers) &&
+                                 desc.buffer_type == BufferType::Guest && desc.scalar_reads_only &&
+                                 !desc.is_written && desc.used_types == IR::Type::U32;
             spv_buffer.Alias(PointerType::U32) =
-                DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, U32[1]);
+                DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, U32[1], uniform);
         }
         if (True(desc.used_types & IR::Type::F32)) {
             spv_buffer.Alias(PointerType::F32) =

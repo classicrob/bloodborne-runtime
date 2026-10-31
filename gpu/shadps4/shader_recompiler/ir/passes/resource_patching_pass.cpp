@@ -109,6 +109,7 @@ public:
         buffer.used_types |= desc.used_types;
         buffer.is_written |= desc.is_written;
         buffer.is_formatted |= desc.is_formatted;
+        buffer.scalar_reads_only &= desc.scalar_reads_only;
         return index;
     }
 
@@ -206,6 +207,7 @@ void PatchBufferSharp(const ResourceDiscovery& resource, Info& info, Descriptors
         .is_written = IsBufferStore(inst),
         .is_formatted = inst.GetOpcode() == IR::Opcode::LoadBufferFormatF32 ||
                         inst.GetOpcode() == IR::Opcode::StoreBufferFormatF32,
+        .scalar_reads_only = inst.GetOpcode() == IR::Opcode::ReadConstBuffer,
         .post_op = resource.sharps[0].post_op,
         .post_op_dw1_mask = resource.sharps[0].post_op_data.dw1_mask,
     });

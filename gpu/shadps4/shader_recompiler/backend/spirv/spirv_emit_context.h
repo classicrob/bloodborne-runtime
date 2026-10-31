@@ -439,7 +439,7 @@ private:
                                     bool output, bool loaded = false, bool array = false);
 
     BufferSpv DefineBuffer(bool is_written, bool is_coherent, u32 elem_shift,
-                           BufferType buffer_type, Id data_type);
+                           BufferType buffer_type, Id data_type, bool uniform = false);
 
     Id DefineFloat32ToUfloatM5(u32 mantissa_bits, std::string_view name);
     Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);

@@ -81,6 +81,9 @@ struct BufferResource {
     BufferType buffer_type{};
     bool is_written{};
     bool is_formatted{};
+    /// bbport: every access is a scalar constant read (S_BUFFER_LOAD), so its index is the same
+    /// in every invocation (Profile::uniform_const_buffers).
+    bool scalar_reads_only{};
     SharpFetchPostOp post_op{};
     u32 post_op_dw1_mask{};
 
