@@ -11,6 +11,9 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#if BB_METAL_BACKEND
+#include "video_core/renderer_metal/mtl_vk_layer.h"
+#endif
 #include "video_core/renderer_vulkan/vk_backend_device.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_state.h"
@@ -23,6 +26,19 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Vulkan {
+
+namespace {
+/// bbport: a pipeline stage of draws (or every stage).
+bool IsGraphicsStage(vk::PipelineStageFlags2 stages) {
+    using S = vk::PipelineStageFlagBits2;
+    constexpr vk::PipelineStageFlags2 graphics =
+        S::eAllCommands | S::eAllGraphics | S::eVertexShader | S::eTessellationControlShader |
+        S::eTessellationEvaluationShader | S::eGeometryShader | S::eFragmentShader |
+        S::eEarlyFragmentTests | S::eLateFragmentTests | S::eColorAttachmentOutput |
+        S::ePreRasterizationShaders | S::eTransformFeedbackEXT;
+    return bool(stages & graphics);
+}
+} // namespace
 
 static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     switch (type) {
@@ -1358,6 +1374,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     };
     if (src_access & WRITE_MASK) {
         insert(Access::Write);
+        graphics_write |= IsGraphicsStage(src_stage);
     }
     if (src_access & READ_MASK) {
         insert(Access::Read);
@@ -1372,6 +1389,7 @@ void Runtime::AccessGlobal(vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 s
     if (src_access & vk::AccessFlagBits2::eShaderWrite) {
         memory_barrier.srcAccessMask |= vk::AccessFlagBits2::eShaderWrite;
         global_write = true;
+        graphics_write |= IsGraphicsStage(src_stage);
     }
 }
 
@@ -1382,6 +1400,24 @@ u32 Runtime::BindingLayout(const VideoCore::Image& image) const {
 void Runtime::FlushBarriers() {
     BeforeImageAccess();
     vk::DependencyInfo dep_info{};
+    // bbport (experiment bit 5, MetalBarrierInPass): on the native Metal renderer a barrier
+    // encodes nothing (MetalFrame::Barrier; Metal orders the encoders), so ending the open pass for
+    // it only stores and reloads the attachments. The pass is kept unless its own draws may have
+    // written what is waited for (a graphics-stage write since the last flush), or images change
+    // state (attachments sampled by the next draw, layout changes): those still end it.
+    const bool in_pass = scheduler.IsRendering() &&
+                         (memory_barrier.srcStageMask || !image_barriers.empty());
+#if BB_METAL_BACKEND
+    const bool keep_pass = in_pass && MetalLayer::FrameEnabled() && image_barriers.empty() &&
+                           !graphics_write && BbToggle::Experiment(1ull << 5);
+    if (in_pass && MetalLayer::PassStats()) {
+        MetalLayer::NoteBarrierInPass(!image_barriers.empty() ? 0 : graphics_write ? 1 : 2,
+                                      keep_pass);
+    }
+#else
+    const bool keep_pass = false;
+#endif
+    graphics_write = false;
 
     if (memory_barrier.srcStageMask) {
         dep_info.pMemoryBarriers = &memory_barrier;
@@ -1396,7 +1432,9 @@ void Runtime::FlushBarriers() {
         return;
     }
 
-    scheduler.EndRendering();
+    if (!keep_pass) {
+        scheduler.EndRendering();
+    }
     scheduler.Record([enc = encoder, memory = memory_barrier,
                       has_memory = dep_info.memoryBarrierCount != 0,
                       images = scheduler.RecordData(std::span<const vk::ImageMemoryBarrier2>(

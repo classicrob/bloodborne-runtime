@@ -248,7 +248,18 @@ size_t AddressBufferCount();
 struct Stats {
     std::atomic<u64> draws{}, dispatches{}, skipped_no_pipeline{}, skipped_tess{},
         skipped_emulated{}, skipped_discard{}, unsupported{}, tess_draws{}, tess_after_tess{};
+    /// BB_METAL_PASS_STATS=1: how the frame is split into encoders and render passes.
+    std::atomic<u64> frames{}, passes{}, passes_empty{}, passes_clear_only{}, render_encoders{},
+        render_reopened{}, compute_encoders{}, blit_encoders{}, tess_runs{}, geometry_draws{},
+        loads[3][3]{},  ///< [color, depth, stencil][Load, Clear, DontCare], per render encoder
+        stores[3][2]{}, ///< [color, depth, stencil][Store, DontCare]
+        load_bytes{}, store_bytes{}, reopen_load_bytes{}, ///< estimated attachment traffic
+        // Barriers flushed in an open pass (Vulkan::Runtime::FlushBarriers), by what they wait for;
+        // kept: the pass stayed open (experiment MetalBarrierInPass).
+        barrier_images{}, barrier_graphics_write{}, barrier_other{}, barrier_kept{};
 };
+/// BB_METAL_PASS_STATS=1 (diagnostics, off by default).
+bool PassStats();
 Stats& GetStats();
 
 } // namespace MetalFrame
