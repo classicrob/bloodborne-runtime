@@ -186,6 +186,8 @@ void Report() {
                     s.unsupported.exchange(0) / seconds, MetalFrame::AddressBufferCount(),
                     s.tess_draws.exchange(0) / seconds, s.tess_after_tess.exchange(0) / seconds);
         if (MetalFrame::PassStats()) {
+            std::printf("Metal buffer compute per second: %.0f copies/updates, %.0f fills\n",
+                        s.compute_copies.exchange(0) / seconds, s.compute_fills.exchange(0) / seconds);
             // Per frame: frames counted by the presents.
             const double f = std::max<double>(1, s.frames.exchange(0));
             const auto x = [&](std::atomic<u64>& v) { return double(v.exchange(0)) / f; };

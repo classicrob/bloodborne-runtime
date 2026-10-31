@@ -241,6 +241,7 @@ size_t AddressBufferCount();
 
 /// Counters for BB_FRAME_STATS-style reports (skipped work by reason).
 struct Stats {
+    std::atomic<u64> compute_copies{}, compute_fills{};
     std::atomic<u64> draws{}, dispatches{}, skipped_no_pipeline{}, skipped_tess{},
         skipped_emulated{}, skipped_discard{}, unsupported{}, tess_draws{}, tess_after_tess{};
     /// BB_METAL_PASS_STATS=1: how the frame is split into encoders and render passes.
