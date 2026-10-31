@@ -234,6 +234,47 @@ void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
     }
 }
 
+u64 AttachmentBytes(MTLRenderPassAttachmentDescriptor* a);
+
+/// BB_METAL_PASS_STATS=1: a render encoder's load and store actions and the attachment memory
+/// they read and write (whole attachments: a tile-based GPU loads and stores them all).
+void NoteRenderEncoder(MTLRenderPassDescriptor* rp, bool reopened) {
+    ++stats.render_encoders;
+    if (reopened) {
+        ++stats.render_reopened;
+    }
+    const auto note = [&](MTLRenderPassAttachmentDescriptor* a, int kind) {
+        if (!a.texture) {
+            return;
+        }
+        const int load = a.loadAction == MTLLoadActionLoad ? 0 : a.loadAction == MTLLoadActionClear ? 1 : 2;
+        ++stats.loads[kind][load];
+        ++stats.stores[kind][a.storeAction == MTLStoreActionDontCare ? 1 : 0];
+        const u64 bytes = AttachmentBytes(a);
+        if (load == 0) {
+            stats.load_bytes += bytes;
+            if (reopened) {
+                stats.reopen_load_bytes += bytes;
+            }
+        }
+        if (a.storeAction != MTLStoreActionDontCare) {
+            stats.store_bytes += bytes;
+        }
+    };
+    for (u32 i = 0; i < 8; ++i) {
+        note(rp.colorAttachments[i], 0);
+    }
+    note(rp.depthAttachment, 1);
+    // A combined depth-stencil texture is counted once (with its depth).
+    if (rp.stencilAttachment.texture != rp.depthAttachment.texture) {
+        note(rp.stencilAttachment, 2);
+    } else if (rp.stencilAttachment.texture) {
+        const auto* a = rp.stencilAttachment;
+        ++stats.loads[2][a.loadAction == MTLLoadActionLoad ? 0 : a.loadAction == MTLLoadActionClear ? 1 : 2];
+        ++stats.stores[2][a.storeAction == MTLStoreActionDontCare ? 1 : 0];
+    }
+}
+
 /// The render encoder of the current pass, opened on first use: a pass without draws costs
 /// nothing unless it clears (EndRendering), and work before its first draw (tessellation
 /// kernels) goes before it instead of splitting it.
@@ -249,6 +290,9 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
         [o.blit endEncoding];
         o.blit = nil;
     }
+    if (PassStats()) {
+        NoteRenderEncoder(o.pass_opened ? o.pass : o.pass_first, o.pass_opened);
+    }
     o.render = [o.cmd renderCommandEncoderWithDescriptor:o.pass_opened ? o.pass : o.pass_first];
     o.pass_opened = true;
     o.cache = {};
@@ -263,6 +307,9 @@ id<MTLComputeCommandEncoder> ComputeEncoder(Owned& o) {
         return o.compute;
     }
     EndEncoders(o);
+    if (PassStats()) {
+        ++stats.compute_encoders;
+    }
     o.compute = [o.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
     UseAddressBuffers(o.compute, false);
     return o.compute;
@@ -273,6 +320,9 @@ id<MTLBlitCommandEncoder> BlitEncoder(Owned& o) {
         return o.blit;
     }
     EndEncoders(o);
+    if (PassStats()) {
+        ++stats.blit_encoders;
+    }
     o.blit = [o.cmd blitCommandEncoder];
     return o.blit;
 }
@@ -644,6 +694,17 @@ Block BlockOf(MTLPixelFormat f) {
     }
 }
 
+u64 AttachmentBytes(MTLRenderPassAttachmentDescriptor* a) {
+    id<MTLTexture> t = a.texture;
+    MTLPixelFormat f = t.pixelFormat;
+    u32 bytes = BlockOf(f).bytes;
+    if (!bytes) {
+        bytes = f == MTLPixelFormatDepth32Float_Stencil8 ? 5 : f == MTLPixelFormatDepth24Unorm_Stencil8 ? 4 : 4;
+    }
+    const u64 w = std::max<NSUInteger>(1, t.width >> a.level), h = std::max<NSUInteger>(1, t.height >> a.level);
+    return w * h * bytes * std::max<NSUInteger>(1, t.sampleCount);
+}
+
 void BufferImageCopy(Owned& o, BufferRef buffer, id<MTLTexture> texture,
                      const VkBufferImageCopy& r, bool to_image) {
     MTLPixelFormat format = texture.pixelFormat;
@@ -704,6 +765,14 @@ id<MTLTexture> ImageTexture(VkImage image) {
 
 Stats& GetStats() {
     return stats;
+}
+
+bool PassStats() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_METAL_PASS_STATS");
+        return env && env[0] == '1';
+    }();
+    return enabled;
 }
 
 size_t AddressBufferCount() {
@@ -1170,6 +1239,9 @@ void BeginRendering(Owned& o, const VkRenderingInfo* info) {
     o.last_draw_tess = false;
     o.pass_first = rp;
     o.pass_opened = false;
+    if (PassStats()) {
+        ++stats.passes;
+    }
     o.pass_clears = false;
     for (u32 i = 0; i < info->colorAttachmentCount; ++i) {
         o.pass_clears |= rp.colorAttachments[i].texture &&
@@ -1194,6 +1266,9 @@ void BeginRendering(Owned& o, const VkRenderingInfo* info) {
 
 void EndRendering(Owned& o) {
     FlushPending(o);
+    if (PassStats() && !o.render && !o.pass_opened) {
+        ++(o.pass_clears ? stats.passes_clear_only : stats.passes_empty);
+    }
     if (!o.render && !o.pass_opened && o.pass_clears) {
         RenderEncoder(o); // a pass without draws still performs its clears
     }
@@ -1485,6 +1560,9 @@ void TessellatedDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 ver
                        vb.buffer ? vb.offset : 0, slot.constant || !vb.stride ? 16 : vb.stride,
                        slot.slot};
     }
+    if (PassStats() && !o.last_draw_tess) {
+        ++stats.tess_runs;
+    }
     // Steps 1 and 2: the kernels go before the pass when it has not begun, else interrupt it.
     id<MTLComputeCommandEncoder> enc = ComputeEncoder(o);
     const auto plan = Metal::Tessellation::PlanScratch(tess, patches);
@@ -1519,6 +1597,9 @@ void GeometryDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 vertex
     const u32 prims = geo.info.input_vertices ? count / geo.info.input_vertices : 0;
     if (!prims || !instance_count) {
         return;
+    }
+    if (PassStats()) {
+        ++stats.geometry_draws;
     }
     if (instance_count > 1) {
         Log("instanced geometry-shader draws draw instance 0 only");
