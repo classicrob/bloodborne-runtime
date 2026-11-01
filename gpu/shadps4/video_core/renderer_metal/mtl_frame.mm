@@ -1613,7 +1613,9 @@ void GeometryDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 vertex
     }
     ++stats.draws;
     ++o.chunk_draws;
-    MetalGpuTiming::NoteWork(o.timing);
+    MetalGpuTiming::NoteWork(o.timing, o.graphics && o.graphics->render
+                                           ? (__bridge id<MTLFunction>)o.graphics->render->vertex_function
+                                           : nil);
 }
 } // namespace
 
@@ -1673,7 +1675,9 @@ void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 
                 baseInstance:first_instance];
     ++stats.draws;
     ++o.chunk_draws;
-    MetalGpuTiming::NoteWork(o.timing);
+    MetalGpuTiming::NoteWork(o.timing, o.graphics && o.graphics->render
+                                           ? (__bridge id<MTLFunction>)o.graphics->render->vertex_function
+                                           : nil);
 }
 
 void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
@@ -1714,7 +1718,9 @@ void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
                        baseInstance:first_instance];
     ++stats.draws;
     ++o.chunk_draws;
-    MetalGpuTiming::NoteWork(o.timing);
+    MetalGpuTiming::NoteWork(o.timing, o.graphics && o.graphics->render
+                                           ? (__bridge id<MTLFunction>)o.graphics->render->vertex_function
+                                           : nil);
 }
 
 void DrawIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset, u32 count, u32 stride,
@@ -1760,7 +1766,7 @@ void Dispatch(Owned& o, u32 x, u32 y, u32 z) {
         threadsPerThreadgroup:MTLSizeMake(p->threads_per_group[0], p->threads_per_group[1],
                                           p->threads_per_group[2])];
     ++stats.dispatches;
-    MetalGpuTiming::NoteWork(o.timing);
+    MetalGpuTiming::NoteWork(o.timing, p->shader ? p->shader->entry.c_str() : nullptr);
 }
 
 void DispatchIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset) {
@@ -1779,7 +1785,7 @@ void DispatchIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset) {
                                                             p->threads_per_group[1],
                                                             p->threads_per_group[2])];
     ++stats.dispatches;
-    MetalGpuTiming::NoteWork(o.timing);
+    MetalGpuTiming::NoteWork(o.timing, p->shader ? p->shader->entry.c_str() : nullptr);
 }
 
 void CopyBuffer(Owned& o, VkBuffer src, VkBuffer dst, u32 count, const VkBufferCopy* regions) {

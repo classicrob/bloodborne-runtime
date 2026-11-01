@@ -33,6 +33,8 @@ struct Encoder {
     const char* origin{};
     unsigned colors{}, width{}, height{};
     bool depth{};
+    std::string shader; ///< the first draw's vertex function or the first dispatch's kernel
+    unsigned long long command{}; ///< the command buffer's serial (boundaries between them)
 };
 
 /// One encoder's GPU interval, resolved.
@@ -43,12 +45,14 @@ struct Record {
 };
 
 bool enabled = false;
+bool split = false;    ///< BB_METAL_GPU_TIMING=2: vertex and fragment stage ends sampled too
+unsigned every = 1;    ///< BB_METAL_GPU_TIMING_EVERY: one frame in this many sampled
 id<MTLDevice> device;
 id<MTLCounterSet> timestamps;
 std::mutex pool_mutex;
 std::vector<id<MTLCounterSampleBuffer>> pool;
 unsigned created = 0;
-std::atomic<unsigned long long> sampled{0}, unsampled{0};
+std::atomic<unsigned long long> sampled{0}, unsampled{0}, command_serial{0};
 
 // Calibration: GPU ticks to ns, refined at each report.
 MTLTimestamp gpu0{};
@@ -102,6 +106,8 @@ struct Command {
     id<MTLCounterSampleBuffer> buffer;
     unsigned used{};
     std::vector<Encoder> encoders;
+    unsigned long long serial{};
+    double commit_ns{}; ///< since the calibration point: no sample of this buffer is older
 };
 
 namespace {
@@ -149,12 +155,16 @@ Command* Ensure(Command*& state) {
     if (!state) {
         state = new Command;
         state->buffer = TakeBuffer();
+        state->serial = ++command_serial;
     }
     return state;
 }
 
-/// Room for `count` samples in this command buffer's sample buffer.
+/// Room for `count` samples in this command buffer's sample buffer (and this frame is sampled).
 bool Room(Command* c, unsigned count) {
+    if (every > 1 && BbStats::gpu_frames.load(std::memory_order_relaxed) % every != 0) {
+        return false;
+    }
     if (c->buffer && c->used + count <= SamplesPerBuffer) {
         sampled.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -171,6 +181,17 @@ void Calibrate(MTLTimestamp& gpu, std::chrono::steady_clock::time_point& steady)
 
 void Report();
 
+/// GPU ticks to ns over the time since Init.
+void Refine() {
+    MTLTimestamp gpu1{};
+    std::chrono::steady_clock::time_point steady1;
+    Calibrate(gpu1, steady1);
+    if (gpu1 > gpu0) {
+        ns_per_tick = double(std::chrono::duration_cast<std::chrono::nanoseconds>(steady1 - steady0).count()) /
+                      double(gpu1 - gpu0);
+    }
+}
+
 } // namespace
 
 bool Enabled() {
@@ -179,7 +200,7 @@ bool Enabled() {
 
 void Init(id<MTLDevice> dev) {
     const char* env = std::getenv("BB_METAL_GPU_TIMING");
-    if (!env || env[0] != '1' || enabled) {
+    if (!env || (env[0] != '1' && env[0] != '2') || enabled) {
         return;
     }
     device = dev;
@@ -198,8 +219,14 @@ void Init(id<MTLDevice> dev) {
     }
     Calibrate(gpu0, steady0);
     last_report = steady0;
+    split = env[0] == '2';
+    if (const char* n = std::getenv("BB_METAL_GPU_TIMING_EVERY")) {
+        every = std::max(1, std::atoi(n));
+    }
     enabled = true;
-    std::printf("GPU timing: on (timestamps at stage boundaries; draw boundaries %s)\n",
+    std::printf("GPU timing: on (timestamps at stage boundaries%s; one frame in %u; draw boundaries "
+                "%s)\n",
+                split ? ", vertex and fragment ends too" : ", encoder start and end only", every,
                 [device supportsCounterSampling:MTLCounterSamplingPointAtDrawBoundary]
                     ? "also supported" : "not supported");
 }
@@ -209,18 +236,23 @@ void AttachRender(Command*& state, MTLRenderPassDescriptor* pass, const char* or
         return;
     }
     Command* c = Ensure(state);
-    if (!Room(c, 4)) {
+    const unsigned samples = split ? 4 : 2;
+    if (!Room(c, samples)) {
         DetachRender(pass);
         return;
     }
+    // Samples: start of vertex, end of fragment (the encoder's span), then with split the end of
+    // vertex and the start of fragment. Each sample inside a pass costs it overlap with its
+    // neighbours, so by default only the ends are sampled.
     MTLRenderPassSampleBufferAttachmentDescriptor* a = pass.sampleBufferAttachments[0];
     a.sampleBuffer = c->buffer;
     a.startOfVertexSampleIndex = c->used;
-    a.endOfVertexSampleIndex = c->used + 1;
-    a.startOfFragmentSampleIndex = c->used + 2;
-    a.endOfFragmentSampleIndex = c->used + 3;
+    a.endOfFragmentSampleIndex = c->used + 1;
+    a.endOfVertexSampleIndex = split ? c->used + 2 : MTLCounterDontSample;
+    a.startOfFragmentSampleIndex = split ? c->used + 3 : MTLCounterDontSample;
     Encoder e{'R', c->used};
     e.frame = BbStats::gpu_frames.load(std::memory_order_relaxed);
+    e.command = c->serial;
     e.origin = origin;
     std::string colors;
     for (unsigned i = 0; i < 8; ++i) {
@@ -251,7 +283,7 @@ void AttachRender(Command*& state, MTLRenderPassDescriptor* pass, const char* or
     }
     e.signature = std::to_string(e.width) + "x" + std::to_string(e.height) + " [" + colors + "]" +
                   (depth.empty() ? "" : " depth " + depth) + (clears ? " clears" : "");
-    c->used += 4;
+    c->used += samples;
     c->encoders.push_back(std::move(e));
 }
 
@@ -276,6 +308,7 @@ MTLComputePassDescriptor* ComputePass(Command*& state) {
     d.sampleBufferAttachments[0].endOfEncoderSampleIndex = c->used + 1;
     Encoder e{'C', c->used};
     e.frame = BbStats::gpu_frames.load(std::memory_order_relaxed);
+    e.command = c->serial;
     c->used += 2;
     c->encoders.push_back(std::move(e));
     return d;
@@ -295,14 +328,29 @@ MTLBlitPassDescriptor* BlitPass(Command*& state) {
     d.sampleBufferAttachments[0].endOfEncoderSampleIndex = c->used + 1;
     Encoder e{'B', c->used};
     e.frame = BbStats::gpu_frames.load(std::memory_order_relaxed);
+    e.command = c->serial;
     c->used += 2;
     c->encoders.push_back(std::move(e));
     return d;
 }
 
-void NoteWork(Command* state) {
-    if (state && !state->encoders.empty()) {
-        ++state->encoders.back().work;
+void NoteWork(Command* state, const char* function) {
+    if (!state || state->encoders.empty()) {
+        return;
+    }
+    Encoder& e = state->encoders.back();
+    if (e.work++ == 0 && function) {
+        e.shader = function;
+    }
+}
+
+void NoteWork(Command* state, id<MTLFunction> function) {
+    if (!state || state->encoders.empty()) {
+        return;
+    }
+    Encoder& e = state->encoders.back();
+    if (e.work++ == 0 && function) {
+        e.shader = function.name.UTF8String ?: "";
     }
 }
 
@@ -325,16 +373,31 @@ void Commit(Command*& state, id<MTLCommandBuffer> cmd) {
     }
     Command* c = state;
     state = nullptr;
+    c->commit_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - steady0).count());
     [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      // The first resolves a second after Init get a measured tick length (reports refine it).
+      static std::atomic<bool> refined{false};
+      if (!refined.load(std::memory_order_relaxed) &&
+          std::chrono::steady_clock::now() - steady0 > std::chrono::seconds(1) &&
+          !refined.exchange(true)) {
+          Refine();
+      }
       NSData* data = [c->buffer resolveCounterRange:NSMakeRange(0, c->used)];
       if (data && data.length >= c->used * sizeof(MTLCounterResultTimestamp)) {
           const auto* ts = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
-          const auto valid = [](u_int64_t t) { return t != MTLCounterErrorValue && t != 0; };
           const auto ns = [&](u_int64_t t) { return (double(t) - double(gpu0)) * ns_per_tick; };
+          // A stage that did not run leaves its slot as it was: a value from the buffer's last
+          // use, older than this commit (2 ms allowed for the calibration's error).
+          const auto valid = [&](u_int64_t t) {
+              return t != MTLCounterErrorValue && t != 0 && ns(t) >= c->commit_ns - 2e6;
+          };
           std::vector<Record> done;
           done.reserve(c->encoders.size());
           for (auto& e : c->encoders) {
-              const unsigned n = e.kind == 'R' ? 4 : 2;
+              const unsigned n = e.kind == 'R' && split ? 4 : 2;
+              // A render pass without draws runs no vertex stage: its start of vertex stays stale
+              // (rejected above); with split its start of fragment stands in.
               double lo = 0, hi = 0;
               bool any = false;
               for (unsigned i = 0; i < n; ++i) {
@@ -357,8 +420,10 @@ void Commit(Command*& state, id<MTLCommandBuffer> cmd) {
                       const u_int64_t y = ts[r.encoder.first + b].timestamp;
                       return valid(x) && valid(y) && y >= x ? (ns(y) - ns(x)) : 0.0;
                   };
-                  r.vertex = span(0, 1);
-                  r.fragment = span(2, 3);
+                  if (split) {
+                      r.vertex = span(0, 2);
+                      r.fragment = span(3, 1);
+                  }
               }
               done.push_back(std::move(r));
           }
@@ -375,11 +440,12 @@ void Commit(Command*& state, id<MTLCommandBuffer> cmd) {
 namespace {
 
 struct Sum {
+    double exclusive{}; ///< busy time shared out among the encoders running at once (sums to busy)
     double ms{}, vertex{}, fragment{};
     double encoders{}, work{};
 };
 
-/// The kind of a render pass by what it draws into, `full` the largest pass area seen.
+/// The kind of a render pass by what it draws into, `full` the largest color pass area seen.
 std::string KindOf(const Encoder& e, unsigned long long full) {
     if (e.kind == 'C') return "compute";
     if (e.kind == 'B') return "blit";
@@ -420,30 +486,59 @@ void Report() {
     if (taken.empty()) {
         return;
     }
-    // Refine ticks to ns over the whole time since Init (applies to later reports' records).
-    MTLTimestamp gpu1{};
-    std::chrono::steady_clock::time_point steady1;
-    Calibrate(gpu1, steady1);
-    if (gpu1 > gpu0) {
-        ns_per_tick = double(std::chrono::duration_cast<std::chrono::nanoseconds>(steady1 - steady0).count()) /
-                      double(gpu1 - gpu0);
-    }
+    Refine(); // over the whole time since Init (applies to later reports' records)
     std::map<unsigned long long, std::vector<const Record*>> frames;
-    unsigned long long full = 0;
+    // Full size: the size of the color pass with the most draws (the scene's G-buffer).
+    std::map<unsigned long long, unsigned long long> draws_by_area;
     for (const auto& r : taken) {
         frames[r.encoder.frame].push_back(&r);
-        if (r.encoder.kind == 'R' && std::string(r.encoder.origin) == "pass") {
-            full = std::max(full, (unsigned long long)r.encoder.width * r.encoder.height);
+        if (r.encoder.kind == 'R' && std::string(r.encoder.origin) == "pass" && r.encoder.colors) {
+            draws_by_area[(unsigned long long)r.encoder.width * r.encoder.height] += r.encoder.work;
+        }
+    }
+    unsigned long long full = 0, most = 0;
+    for (const auto& [area, d] : draws_by_area) {
+        if (d > most) {
+            most = d;
+            full = area;
         }
     }
     const double n = double(frames.size());
     std::map<std::string, Sum> by_kind, by_pass;
     std::map<std::pair<unsigned, std::string>, Sum> by_position; // GPU order in the frame
     std::map<std::string, Sum> gaps; // idle between encoders, by the kinds on either side
+    std::map<std::string, Sum> by_shader, by_kernel; // render passes by first vertex function, compute by first kernel
+    std::map<std::string, Sum> gap_pairs; // idle by the two encoders on either side and what separates them
     double span = 0, busy = 0, idle = 0, between = 0, gap_count = 0, sum_all = 0;
     double prev_end = -1;
     for (auto& [frame, list] : frames) {
         std::sort(list.begin(), list.end(), [](const Record* a, const Record* b) { return a->start < b->start; });
+        // Exclusive time: each stretch of busy time is shared among the encoders running in it.
+        std::unordered_map<const Record*, double> exclusive;
+        {
+            std::vector<std::pair<double, std::pair<int, const Record*>>> events;
+            for (const Record* r : list) {
+                events.push_back({r->start, {1, r}});
+                events.push_back({r->end, {-1, r}});
+            }
+            std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
+                return a.first != b.first ? a.first < b.first : a.second.first < b.second.first;
+            });
+            std::vector<const Record*> active;
+            double at = events.empty() ? 0 : events.front().first;
+            for (const auto& [t, ev] : events) {
+                if (!active.empty() && t > at) {
+                    const double share = (t - at) / 1e6 / double(active.size());
+                    for (const Record* a : active) exclusive[a] += share;
+                }
+                at = t;
+                if (ev.first > 0) {
+                    active.push_back(ev.second);
+                } else {
+                    active.erase(std::find(active.begin(), active.end(), ev.second));
+                }
+            }
+        }
         const double first = list.front()->start;
         double reach = first, last = first;
         const Record* reaching = list.front();
@@ -455,10 +550,19 @@ void Report() {
             for (auto* s : {&by_kind[kind], &by_pass[e.kind == 'R' ? std::string(1, 'R') + " " + e.signature + (std::string(e.origin) != "pass" ? std::string(" (") + e.origin + ")" : "") : kind],
                             &by_position[{position, e.kind == 'R' ? e.signature : kind}]}) {
                 s->ms += ms;
+                s->exclusive += exclusive[r];
                 s->vertex += r->vertex / 1e6;
                 s->fragment += r->fragment / 1e6;
                 s->encoders += 1;
                 s->work += e.work;
+            }
+            if (e.kind != 'B') {
+                Sum& t = e.kind == 'R' ? by_shader[e.shader.empty() ? "(no draws) " + e.signature : e.shader]
+                                       : by_kernel[e.shader.empty() ? "(no dispatches)" : e.shader];
+                t.ms += ms;
+                t.exclusive += exclusive[r];
+                t.encoders += 1;
+                t.work += e.work;
             }
             ++position;
             sum_all += ms;
@@ -469,6 +573,20 @@ void Report() {
                 auto& s = gaps[KindOf(reaching->encoder, full) + " -> " + kind];
                 s.ms += g;
                 s.encoders += 1;
+                const auto name = [&](const Encoder& x) {
+                    return x.kind == 'R' ? "R " + x.signature
+                           : x.kind == 'C' ? "C " + (x.shader.empty() ? std::string("?") : x.shader)
+                                           : std::string("blit");
+                };
+                const Encoder& p = reaching->encoder;
+                const char* between = p.command != e.command ? "command buffer boundary"
+                                      : p.kind == 'R' && e.kind == 'R' && p.signature == e.signature
+                                          ? "same pass begun again"
+                                      : p.kind == e.kind && p.kind != 'R' ? "same kind (barrier)"
+                                                                          : "encoder change";
+                auto& q = gap_pairs[name(p) + "  ->  " + name(e) + "  [" + between + "]"];
+                q.ms += g;
+                q.encoders += 1;
             }
             if (r->end > reach) {
                 busy += (r->end - std::max(reach, r->start)) / 1e6;
@@ -484,20 +602,23 @@ void Report() {
         prev_end = last;
     }
     const auto s = sampled.exchange(0), u = unsampled.exchange(0);
-    std::printf("GPU timing: %.0f frames; per frame: GPU span %.2f ms, busy %.2f (encoder sum %.2f: "
-                "overlap %.2f), idle between encoders %.2f in %.1f gaps, between frames %.2f "
+    std::printf("GPU timing: %.0f frames; per frame: GPU span %.2f ms, busy %.2f (encoder spans sum to "
+                "%.2f: overlap %.2f), idle between encoders %.2f in %.1f gaps, between frames %.2f "
                 "(present and unsampled work included); %.0f%% of encoders sampled\n",
                 n, span / n, busy / n, sum_all / n, (sum_all - busy) / n, idle / n, gap_count / n,
                 between / n, s + u ? 100.0 * double(s) / double(s + u) : 0.0);
     const auto print = [&](const char* title, const auto& table, size_t top) {
         std::vector<std::pair<std::string, Sum>> rows;
         for (const auto& [k, v] : table) rows.emplace_back(k, v);
-        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
-        std::printf("  %s (ms/frame, vertex, fragment, encoders/frame, draws or dispatches/frame):\n", title);
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.second.exclusive > b.second.exclusive; });
+        std::printf("  %s (ms/frame: exclusive, span, vertex, fragment; encoders/frame, draws or "
+                    "dispatches/frame):\n", title);
         for (size_t i = 0; i < std::min(top, rows.size()); ++i) {
             const Sum& v = rows[i].second;
-            std::printf("    %7.3f %6.3f %6.3f %6.1f %7.1f  %s\n", v.ms / n, v.vertex / n,
-                        v.fragment / n, v.encoders / n, v.work / n, rows[i].first.c_str());
+            std::printf("    %7.3f %7.3f %6.3f %6.3f %6.1f %7.1f  %s\n", v.exclusive / n, v.ms / n,
+                        v.vertex / n, v.fragment / n, v.encoders / n, v.work / n,
+                        rows[i].first.c_str());
         }
     };
     print("by kind", by_kind, 20);
@@ -507,11 +628,22 @@ void Report() {
         positions["#" + std::to_string(k.first) + " " + k.second] = v;
     }
     print("costliest encoders by position in the frame (GPU order)", positions, 20);
+    print("render passes by their first draw's vertex function", by_shader, 20);
+    print("compute encoders by their first kernel", by_kernel, 15);
     std::printf("  idle between encoders by the kinds on either side (ms/frame, gaps/frame):\n");
     std::vector<std::pair<std::string, Sum>> g(gaps.begin(), gaps.end());
     std::sort(g.begin(), g.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     for (size_t i = 0; i < std::min<size_t>(12, g.size()); ++i) {
         std::printf("    %7.3f %6.1f  %s\n", g[i].second.ms / n, g[i].second.encoders / n, g[i].first.c_str());
+    }
+    std::printf("  largest idle by the encoders on either side and what separates them (ms/frame, "
+                "gaps/frame, us per gap):\n");
+    std::vector<std::pair<std::string, Sum>> pg(gap_pairs.begin(), gap_pairs.end());
+    std::sort(pg.begin(), pg.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    for (size_t i = 0; i < std::min<size_t>(25, pg.size()); ++i) {
+        const Sum& v = pg[i].second;
+        std::printf("    %7.3f %6.1f %6.0f  %s\n", v.ms / n, v.encoders / n,
+                    v.encoders ? 1000.0 * v.ms / v.encoders : 0.0, pg[i].first.c_str());
     }
 }
 

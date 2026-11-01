@@ -5,6 +5,9 @@
 // render pass signature (attachment formats and size), the costliest encoders of the frame, and
 // the GPU's idle time between encoders by the kinds on either side. Off by default; for
 // measuring only (Metal System Trace gives no GPU timeline on some macOS versions).
+// =1 samples each encoder's start and end; =2 also the ends of the vertex and fragment stages
+// (vertex/fragment split, at more cost to overlap). BB_METAL_GPU_TIMING_EVERY=N samples one
+// frame in N (the others run undisturbed).
 #pragma once
 
 #import <Metal/Metal.h>
@@ -26,8 +29,10 @@ void DetachRender(MTLRenderPassDescriptor* pass);
 /// A compute/blit pass descriptor carrying the sample attachment, or nil (then encode as before).
 MTLComputePassDescriptor* ComputePass(Command*& state);
 MTLBlitPassDescriptor* BlitPass(Command*& state);
-/// Counts a draw or dispatch into the current encoder (shown next to its time).
-void NoteWork(Command* state);
+/// Counts a draw or dispatch into the current encoder (shown next to its time); the first one's
+/// vertex function or kernel names the encoder in the shader tables (MSL entry names).
+void NoteWork(Command* state, id<MTLFunction> function = nil);
+void NoteWork(Command* state, const char* function);
 /// Before `cmd` commits: resolves its samples once the GPU is done. Resets `state`.
 void Commit(Command*& state, id<MTLCommandBuffer> cmd);
 /// A command buffer dropped without a commit.
