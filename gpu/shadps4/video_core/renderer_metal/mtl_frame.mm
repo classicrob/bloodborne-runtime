@@ -216,6 +216,12 @@ void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
         return;
     }
     std::vector<id<MTLResource>> resources(declared_buffers.begin(), declared_buffers.end());
+    // Experiment bit 13 (PROBE ONLY, unsafe: drops the ordering of compute writes before
+    // draws): render encoders do not declare the guest memory (it stays resident through the
+    // residency set), to measure whether the declarations make dependent passes wait longer.
+    if (render && BbToggle::Experiment(1ull << 13)) {
+        return;
+    }
     if (render) {
         // Render passes read guest memory through pointers; writes come from compute. Declaring
         // them writers too made every pass wait for the one before (no vertex/fragment overlap).
