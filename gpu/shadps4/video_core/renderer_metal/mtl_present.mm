@@ -128,6 +128,7 @@ id<MTLRenderPipelineState> Pipeline(Passes& passes, id<MTLDevice> device, MTLPix
 
 bool Present(void* layer_ptr, PresentInfo info) {
     ++MetalFrame::GetStats().frames;
+    ++MetalFrame::GetStats().presents;
     MetalFrame::PassDumpPresent();
     @autoreleasepool {
         CAMetalLayer* layer = (__bridge CAMetalLayer*)layer_ptr;

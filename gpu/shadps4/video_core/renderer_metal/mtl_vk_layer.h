@@ -31,6 +31,9 @@ void* MtlQueue();
 /// Step C (BB_METAL_FRAME=1): every command buffer is encoded in Metal.
 bool FrameEnabled();
 
+/// Frames presented so far.
+unsigned long long PresentCount();
+
 /// BB_METAL_PASS_STATS=1 (diagnostics): how frames are split into encoders and render passes,
 /// in the 5 s Metal frame report.
 bool PassStats();

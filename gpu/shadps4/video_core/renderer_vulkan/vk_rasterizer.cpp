@@ -14,6 +14,9 @@
 #include "game_profile.h"
 #include "bbport_ce_stats.h"
 #include "bbport_toggles.h"
+#if BB_METAL_BACKEND
+#include "video_core/renderer_metal/mtl_vk_layer.h"
+#endif
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
 #include "bbport_guest_memory.h"
@@ -2465,9 +2468,21 @@ void Rasterizer::NoteDecodedPacket(bool work) {
     if (!early_work || (++early_packets & 7) != 0) {
         return; // the GPU is asked at most every 8 packets (a system call)
     }
+#if BB_METAL_BACKEND
+    // At most once a frame: the gap to remove is the one at a frame's start, after the last
+    // pass of the frame before (committing whenever the GPU caught up mid-frame, ~1.7 a frame,
+    // cost more in drained draw pipes and split passes than it saved: 56 against 60-63 FPS).
+    const u64 frame = MetalLayer::PresentCount();
+    if (frame == early_frame) {
+        return;
+    }
+#endif
     if (tick == 0 || !device.IsComplete(tick - 1)) {
         return; // the GPU is still busy: this work waits for the regular submission
     }
+#if BB_METAL_BACKEND
+    early_frame = frame;
+#endif
     Flush();
     static std::atomic<u64> commits{0};
     const u64 n = commits.fetch_add(1, std::memory_order_relaxed) + 1;

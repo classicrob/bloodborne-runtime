@@ -1231,6 +1231,10 @@ bool PassStats() {
     return MetalFrame::PassStats();
 }
 
+unsigned long long PresentCount() {
+    return MetalFrame::GetStats().presents.load(std::memory_order_relaxed);
+}
+
 unsigned long long ImageOfView(unsigned long long view) {
     return (unsigned long long)MetalFrame::ImageOfView(VkImageView(view));
 }

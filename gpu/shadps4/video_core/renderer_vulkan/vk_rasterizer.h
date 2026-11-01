@@ -472,6 +472,7 @@ private:
     u64 early_tick{};
     bool early_work{};
     u32 early_packets{};
+    u64 early_frame{~0ull};
     // The Vulkan backend's own parts only: the buffer cache's sparse arena and the upscaler.
     const Instance& instance;
     Scheduler& scheduler;
