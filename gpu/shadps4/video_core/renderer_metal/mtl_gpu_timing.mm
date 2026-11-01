@@ -531,7 +531,8 @@ void Report() {
                 events.push_back({r->end, {-1, r}});
             }
             std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
-                return a.first != b.first ? a.first < b.first : a.second.first < b.second.first;
+                // Starts before ends at one instant: a zero-length encoder is added before it goes.
+                return a.first != b.first ? a.first < b.first : a.second.first > b.second.first;
             });
             std::vector<const Record*> active;
             double at = events.empty() ? 0 : events.front().first;
@@ -544,7 +545,10 @@ void Report() {
                 if (ev.first > 0) {
                     active.push_back(ev.second);
                 } else {
-                    active.erase(std::find(active.begin(), active.end(), ev.second));
+                    if (const auto it = std::find(active.begin(), active.end(), ev.second);
+                        it != active.end()) {
+                        active.erase(it);
+                    }
                 }
             }
         }
