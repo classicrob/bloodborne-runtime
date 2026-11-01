@@ -1808,6 +1808,35 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         buffer_cache.Preupload(budget);
     }
     const auto& regs = Regs();
+    // bbport BB_SMALL_PASS_LOG=1 (diagnostics): each kind of draw into one small color target
+    // (under 1024 pixels wide: post-effect chains) once, by shader pair, size and format, then
+    // every 4,096 draws of that kind.
+    static const bool small_pass_log = std::getenv("BB_SMALL_PASS_LOG") != nullptr;
+    if (small_pass_log && pipeline->GetGraphicsKey().num_color_attachments == 1 &&
+        regs.color_buffers[0]) {
+        // The target's own size: post-effect passes may leave the scissor at full screen.
+        const u32 width = regs.color_buffers[0].Pitch();
+        const u32 height = regs.color_buffers[0].Height();
+        if (width < 1024) {
+            const auto& key = pipeline->GetGraphicsKey();
+            const u32 format = u32(regs.color_buffers[0].GetDataFmt());
+            const u64 id = key.stage_hashes[0] ^ (key.stage_hashes[3] * 31) ^
+                           (u64(width) << 40) ^ (u64(height) << 20) ^ format;
+            static std::mutex mutex;
+            static std::unordered_map<u64, u64> seen;
+            std::scoped_lock lock{mutex};
+            const u64 count = ++seen[id];
+            if (count == 1 || count % 4096 == 0) {
+                std::printf("Small pass: ps %016llx vs %016llx %ux%u (scissor %ux%u) format %u "
+                            "prim %u indices %u, %llu draws\n",
+                            (unsigned long long)key.stage_hashes[0],
+                            (unsigned long long)key.stage_hashes[3], width, height,
+                            regs.screen_scissor.GetWidth(), regs.screen_scissor.GetHeight(), format,
+                            u32(regs.primitive_type), regs.num_indices,
+                            (unsigned long long)count);
+            }
+        }
+    }
     static const bool fixed_probe = std::getenv("BB_FIXED_QUAD_PROBE") != nullptr;
     if (fixed_probe) {
         static std::atomic<u64> ls_hs_draws{0};
