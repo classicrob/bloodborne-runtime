@@ -531,7 +531,8 @@ void Report() {
                 events.push_back({r->end, {-1, r}});
             }
             std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
-                return a.first != b.first ? a.first < b.first : a.second.first < b.second.first;
+                // Starts before ends at one instant: a zero-length encoder is added before it goes.
+                return a.first != b.first ? a.first < b.first : a.second.first > b.second.first;
             });
             std::vector<const Record*> active;
             double at = events.empty() ? 0 : events.front().first;
@@ -544,7 +545,10 @@ void Report() {
                 if (ev.first > 0) {
                     active.push_back(ev.second);
                 } else {
-                    active.erase(std::find(active.begin(), active.end(), ev.second));
+                    if (const auto it = std::find(active.begin(), active.end(), ev.second);
+                        it != active.end()) {
+                        active.erase(it);
+                    }
                 }
             }
         }
@@ -626,7 +630,13 @@ void Report() {
                 "(present and unsampled work included); %.0f%% of encoders sampled\n",
                 n, span / n, busy / n, sum_all / n, (sum_all - busy) / n, idle / n, gap_count / n,
                 between / n, s + u ? 100.0 * double(s) / double(s + u) : 0.0);
+    // BB_METAL_GPU_TIMING_TOP=N: N rows per table instead of each table's default.
+    static const size_t top_rows = [] {
+        const char* v = std::getenv("BB_METAL_GPU_TIMING_TOP");
+        return v ? size_t(std::max(1, std::atoi(v))) : size_t(0);
+    }();
     const auto print = [&](const char* title, const auto& table, size_t top) {
+        top = top_rows ? top_rows : top;
         std::vector<std::pair<std::string, Sum>> rows;
         for (const auto& [k, v] : table) rows.emplace_back(k, v);
         std::sort(rows.begin(), rows.end(),
