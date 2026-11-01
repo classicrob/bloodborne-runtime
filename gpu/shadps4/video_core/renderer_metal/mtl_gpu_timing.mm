@@ -603,6 +603,8 @@ void Report() {
                                        : by_kernel[e.shader.empty() ? "(no dispatches)" : e.shader];
                 t.ms += ms;
                 t.exclusive += exclusive[r];
+                t.vertex += r->vertex / 1e6;
+                t.fragment += r->fragment / 1e6;
                 t.encoders += 1;
                 t.work += e.work;
             }
