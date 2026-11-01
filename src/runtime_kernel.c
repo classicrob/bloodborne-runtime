@@ -122,6 +122,48 @@ void runtime_sleep_stats(uint64_t *calls, uint64_t *ns, uint64_t *requested_ns) 
     *calls=atomic_exchange(&sleep_calls,0); *ns=atomic_exchange(&sleep_total_ns,0);
     *requested_ns=atomic_exchange(&sleep_requested_ns,0);
 }
+/* bbport BB_SLEEP_STATS=1 (diagnostics): the game's sleeps by host thread name, every 5 s:
+ * calls, requested and actual time, the longest overshoot, and how many overshot by more than
+ * 5 ms. Guest sleeps took about twice what they asked for (frame stats), and a late wake of the
+ * thread that submits a frame delays the frame. */
+typedef struct { char name[16]; uint64_t calls, requested_ns, actual_ns, max_over_ns, over5; } SleepSite;
+static SleepSite sleep_sites[48];
+static pthread_mutex_t sleep_sites_lock=PTHREAD_MUTEX_INITIALIZER;
+static void sleep_stats_note(uint64_t requested, uint64_t actual) {
+    static int enabled=-1;
+    if (enabled<0) { const char *e=getenv("BB_SLEEP_STATS"); enabled=e && e[0]=='1'; }
+    if (!enabled) return;
+    char name[16]={0};
+    pthread_getname_np(pthread_self(),name,sizeof(name));
+    const uint64_t over=actual>requested ? actual-requested : 0;
+    static struct timespec last;
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+    pthread_mutex_lock(&sleep_sites_lock);
+    SleepSite *site=NULL;
+    for (size_t i=0;i<sizeof(sleep_sites)/sizeof(sleep_sites[0]);++i) {
+        if (!sleep_sites[i].calls || !strcmp(sleep_sites[i].name,name)) { site=&sleep_sites[i]; break; }
+    }
+    if (site) {
+        if (!site->calls) memcpy(site->name,name,sizeof(name));
+        ++site->calls; site->requested_ns+=requested; site->actual_ns+=actual;
+        if (over>site->max_over_ns) site->max_over_ns=over;
+        if (over>5000000) ++site->over5;
+    }
+    if (!last.tv_sec) last=now;
+    if (now.tv_sec-last.tv_sec>=5) {
+        const double secs=(double)(now.tv_sec-last.tv_sec)+(now.tv_nsec-last.tv_nsec)/1e9;
+        printf("Sleep stats (%.1f s):\n",secs);
+        for (size_t i=0;i<sizeof(sleep_sites)/sizeof(sleep_sites[0]) && sleep_sites[i].calls;++i) {
+            const SleepSite *t=&sleep_sites[i];
+            printf("  %-15s %6.1f/s, requested %7.3f ms, slept %7.3f ms on average; longest overshoot "
+                   "%.1f ms, %llu over 5 ms\n",t->name,t->calls/secs,t->requested_ns/1e6/t->calls,
+                   t->actual_ns/1e6/t->calls,t->max_over_ns/1e6,(unsigned long long)t->over5);
+        }
+        memset(sleep_sites,0,sizeof(sleep_sites));
+        last=now;
+    }
+    pthread_mutex_unlock(&sleep_sites_lock);
+}
 static int sleep_ns(uint64_t ns) {
     struct timespec t={.tv_sec=(time_t)(ns/1000000000),.tv_nsec=(long)(ns%1000000000)}, a, b;
     clock_gettime(CLOCK_MONOTONIC,&a);
@@ -132,6 +174,7 @@ static int sleep_ns(uint64_t ns) {
     atomic_fetch_add(&sleep_requested_ns,ns);
     atomic_fetch_add(&sleep_total_ns,(uint64_t)((b.tv_sec-a.tv_sec)*1000000000+(b.tv_nsec-a.tv_nsec)));
     runtime_wait_note(3,(uint64_t)((b.tv_sec-a.tv_sec)*1000000000+(b.tv_nsec-a.tv_nsec)));
+    sleep_stats_note(ns,(uint64_t)((b.tv_sec-a.tv_sec)*1000000000+(b.tv_nsec-a.tv_nsec)));
     return result;
 }
 static ABI int32_t kernel_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
