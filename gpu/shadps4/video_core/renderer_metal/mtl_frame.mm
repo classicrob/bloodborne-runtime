@@ -2,6 +2,7 @@
 // From Wooloomooloo2/bloodborne_mac_port (78b59f5, GPL-2.0-or-later), adapted to bloodborne-runtime.
 
 #include <dlfcn.h>
+#include "bbport_toggles.h"
 #include <xxhash.h>
 #include <mach-o/dyld.h>
 #include <algorithm>
@@ -1763,11 +1764,127 @@ void DispatchIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset) {
     ++stats.dispatches;
 }
 
+// Vector transfers use 16 or 4 bytes per thread, with byte transfers for unaligned ranges.
+// The serial encoder orders these kernels with
+// surrounding game dispatches. Deferred patch draws must be flushed by the blit path
+// before changing their buffers. Compute bindings are never cached: Dispatch/DispatchIndirect
+// set the pipeline and BindStage rebinds every resource, including push constants, each time.
+bool CopyComputeStats() {
+    static const bool enabled = [] { const char* e = std::getenv("BB_COPY_AS_COMPUTE_STATS");
+                                     return e && e[0] == '1'; }();
+    return enabled;
+}
+static bool BufferAsCompute(Owned& o, id<MTLBuffer> src, u64 src_base,
+                            id<MTLBuffer> dst, u64 dst_base, u32 count,
+                            const VkBufferCopy* regions, u8 fill) {
+    if (!BbToggle::Experiment(1ull << 10) || !o.compute || o.render ||
+        !o.pending.empty() || !count) return false;
+    static const u64 limit = []() -> u64 {
+        const char* e = std::getenv("BB_COPY_COMPUTE_MAX");
+        return e ? std::min<u64>(std::strtoull(e, nullptr, 0), 1ull << 30) : 65536;
+    }();
+    u64 total = 0;
+    for (u32 i = 0; i < count; ++i) {
+        if (regions[i].size > limit - total) return false;
+        total += regions[i].size;
+    }
+    if (!total) return false;
+    const auto overlaps = [](u64 a, u64 n, u64 b, u64 m) {
+        return n && m && (a <= b ? b - a < n : a - b < m);
+    };
+    // A single dispatch cannot preserve cross-region read/write or write/write dependencies.
+    for (u32 i = 0; i < count; ++i) {
+        for (u32 j = 0; j < count; ++j) {
+            if (src == dst && overlaps(src_base + regions[i].srcOffset, regions[i].size,
+                                      dst_base + regions[j].dstOffset, regions[j].size)) return false;
+            if (j < i && overlaps(dst_base + regions[i].dstOffset, regions[i].size,
+                                  dst_base + regions[j].dstOffset, regions[j].size)) return false;
+        }
+    }
+    struct Region { u64 src, dst; u32 end, width; };
+    static_assert(sizeof(Region) == 24);
+    std::vector<Region> rows;
+    u32 threads = 0;
+    for (u32 i = 0; i < count; ++i) {
+        const auto& r = regions[i];
+        const u64 a = src_base + r.srcOffset, b = dst_base + r.dstOffset;
+        const u64 alignment = (src ? a : 0) | b | r.size;
+        const u32 width = !(alignment & 15) ? 16 : !(alignment & 3) ? 4 : 1;
+        threads += r.size / width;
+        rows.push_back({a, b, threads, width});
+    }
+    static id<MTLComputePipelineState> pipeline;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        NSString* source = @R"msl(
+#include <metal_stdlib>
+using namespace metal;
+struct Region { ulong src, dst; uint end, width; };
+struct Args { uint count, fill, copying; };
+kernel void buffer_vectors(device const uchar* src [[buffer(0)]],
+                           device uchar* dst [[buffer(1)]],
+                           constant Region* rows [[buffer(2)]],
+                           constant Args& a [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    uint lo = 0, hi = a.count;
+    while (lo < hi) {
+        uint mid = lo + (hi - lo) / 2;
+        if (i < rows[mid].end) hi = mid; else lo = mid + 1;
+    }
+    if (lo == a.count) return;
+    Region row = rows[lo];
+    uint start = lo ? rows[lo - 1].end : 0;
+    ulong off = ulong(i - start) * row.width;
+    uint pattern = a.fill * 0x01010101u;
+    if (row.width == 16)
+        *((device uint4*)(dst + row.dst + off)) = a.copying ?
+            *((device const uint4*)(src + row.src + off)) : uint4(pattern);
+    else if (row.width == 4)
+        *((device uint*)(dst + row.dst + off)) = a.copying ?
+            *((device const uint*)(src + row.src + off)) : pattern;
+    else dst[row.dst + off] = a.copying ? src[row.src + off] : uchar(a.fill);
+}
+)msl";
+        NSError* error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+        id<MTLFunction> function = [library newFunctionWithName:@"buffer_vectors"];
+        if (function) pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        if (!pipeline) std::printf("Metal buffer kernel: %s\n", error.localizedDescription.UTF8String);
+    });
+    if (!pipeline) return false;
+    if (src) [o.compute useResource:src usage:MTLResourceUsageRead];
+    [o.compute useResource:dst usage:src == dst ? MTLResourceUsageRead | MTLResourceUsageWrite
+                                               : MTLResourceUsageWrite];
+    [o.compute setComputePipelineState:pipeline];
+    [o.compute setBuffer:src ? src : dst offset:0 atIndex:0];
+    [o.compute setBuffer:dst offset:0 atIndex:1];
+    const size_t bytes = rows.size() * sizeof(Region);
+    if (bytes <= 4096) {
+        [o.compute setBytes:rows.data() length:bytes atIndex:2];
+    } else {
+        id<MTLBuffer> table = [device newBufferWithBytes:rows.data() length:bytes
+                                               options:MTLResourceStorageModeShared];
+        if (!table) return false;
+        o.keep.push_back(table);
+        [o.compute useResource:table usage:MTLResourceUsageRead];
+        [o.compute setBuffer:table offset:0 atIndex:2];
+    }
+    struct { u32 count, fill, copying; } args{count, fill, src != nil};
+    [o.compute setBytes:&args length:sizeof(args) atIndex:3];
+    [o.compute dispatchThreads:MTLSizeMake(threads, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
+    if (CopyComputeStats()) {
+        if (src) ++stats.compute_copies; else ++stats.compute_fills;
+        ++stats.compute_blits_avoided;
+    }
+    return true;
+}
+
 void CopyBuffer(Owned& o, VkBuffer src, VkBuffer dst, u32 count, const VkBufferCopy* regions) {
     const BufferRef s = ResolveBuffer(src), d = ResolveBuffer(dst);
     if (!s.buffer || !d.buffer) {
         return;
     }
+    if (BufferAsCompute(o, s.buffer, s.offset, d.buffer, d.offset, count, regions, 0)) return;
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
     for (u32 i = 0; i < count; ++i) {
         [blit copyFromBuffer:s.buffer
@@ -1788,6 +1905,8 @@ void FillBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, 
         Log("vkCmdFillBuffer with a pattern of different bytes (filled with its low byte)");
     }
     const u64 length = size == VK_WHOLE_SIZE ? d.buffer.length - d.offset - offset : size;
+    const VkBufferCopy region{0, 0, length};
+    if (BufferAsCompute(o, nil, 0, d.buffer, d.offset + offset, 1, &region, b)) return;
     [BlitEncoder(o) fillBuffer:d.buffer range:NSMakeRange(d.offset + offset, length) value:b];
 }
 
@@ -1801,6 +1920,8 @@ void UpdateBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size
                                                 length:size
                                                options:MTLResourceStorageModeShared];
     o.keep.push_back(staging); // the command buffer does not retain it
+    const VkBufferCopy region{0, 0, size};
+    if (BufferAsCompute(o, staging, 0, d.buffer, d.offset + offset, 1, &region, 0)) return;
     [BlitEncoder(o) copyFromBuffer:staging
                       sourceOffset:0
                           toBuffer:d.buffer

@@ -176,6 +176,14 @@ void Report() {
     since = now;
     if (frame_enabled) {
         auto& s = MetalFrame::GetStats();
+        const char* copy_stats = std::getenv("BB_COPY_AS_COMPUTE_STATS");
+        if (copy_stats && copy_stats[0] == '1') {
+            const double f = std::max<double>(1, s.copy_frames.exchange(0));
+            std::printf("Metal copy compute per frame: %.2f copies/updates, %.2f fills, %.2f blits avoided\n",
+                        s.compute_copies.exchange(0) / f, s.compute_fills.exchange(0) / f,
+                        s.compute_blits_avoided.exchange(0) / f);
+        }
+
         std::printf("Metal frame: per second: %.0f draws, %.0f dispatches; skipped: %.0f without "
                     "a Metal pipeline, %.0f tessellated, %.0f emulated topology, %.0f discarded; "
                     "%.0f unsupported commands; %zu device-address buffers declared per encoder; tessellated "
