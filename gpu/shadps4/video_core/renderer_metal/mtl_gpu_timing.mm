@@ -35,6 +35,7 @@ struct Encoder {
     bool depth{};
     std::string shader; ///< the first draw's vertex function or the first dispatch's kernel
     unsigned long long command{}; ///< the command buffer's serial (boundaries between them)
+    double commit_ns{}; ///< when its command buffer was committed (ns since the calibration point)
 };
 
 /// One encoder's GPU interval, resolved.
@@ -47,6 +48,7 @@ struct Record {
 bool enabled = false;
 bool split = false;    ///< BB_METAL_GPU_TIMING=2: vertex and fragment stage ends sampled too
 unsigned every = 1;    ///< BB_METAL_GPU_TIMING_EVERY: one frame in this many sampled
+FILE* gap_file = nullptr; ///< BB_METAL_GPU_TIMING_GAPS=<file>: every gap over 200 us, with times
 unsigned seq_from = 0, seq_to = 0; ///< BB_METAL_GPU_TIMING_SEQ=from-to: these positions in order
 std::string seq_anchor; ///< BB_METAL_GPU_TIMING_SEQ=<text>:<count>[:<before>]: around the first encoder named so
 long seq_before = 0;
@@ -223,6 +225,13 @@ void Init(id<MTLDevice> dev) {
     Calibrate(gpu0, steady0);
     last_report = steady0;
     split = env[0] == '2';
+    if (const char* g = std::getenv("BB_METAL_GPU_TIMING_GAPS")) {
+        gap_file = std::fopen(g, "w");
+        if (gap_file) {
+            // Times are steady_clock ns since its epoch, as BB_TIMELINE writes them.
+            std::fprintf(gap_file, "# frame gap_start_ns gap_us next_commit_ns commit_late_us between | before -> after\n");
+        }
+    }
     if (const char* q = std::getenv("BB_METAL_GPU_TIMING_SEQ")) {
         const std::string v{q};
         if (const auto colon = v.find(':'); colon != std::string::npos) {
@@ -431,6 +440,7 @@ void Commit(Command*& state, id<MTLCommandBuffer> cmd) {
               if (!any || hi < lo) {
                   continue;
               }
+              e.commit_ns = c->commit_ns;
               Record r{std::move(e), lo, hi, 0, 0};
               if (r.encoder.kind == 'R') {
                   const auto span = [&](unsigned a, unsigned b) {
@@ -532,7 +542,7 @@ void Report() {
         std::string label;
     };
     std::map<unsigned, Step> sequence; // BB_METAL_GPU_TIMING_SEQ
-    double span = 0, busy = 0, idle = 0, between = 0, gap_count = 0, sum_all = 0;
+    double span = 0, busy = 0, idle = 0, between = 0, gap_count = 0, sum_all = 0, commit_late = 0;
     double prev_end = -1;
     for (auto& [frame, list] : frames) {
         std::sort(list.begin(), list.end(), [](const Record* a, const Record* b) { return a->start < b->start; });
@@ -641,6 +651,19 @@ void Report() {
                 auto& q = gap_pairs[name(p) + "  ->  " + name(e) + "  [" + between + "]"];
                 q.ms += g;
                 q.encoders += 1;
+                // Across command buffers: was the next one committed only after the GPU ran dry?
+                if (p.command != e.command) {
+                    const double late = std::max(0.0, std::min(e.commit_ns, r->start) - reach) / 1e6;
+                    q.work += late; // ms of the gap before the commit (reported as "commit late")
+                    commit_late += late;
+                }
+                if (gap_file && g > 0.2) {
+                    const double epoch = double(steady0.time_since_epoch().count());
+                    std::fprintf(gap_file, "%llu %.0f %.1f %.0f %.1f %s | %s -> %s\n", frame, epoch + reach,
+                                 g * 1000.0, epoch + e.commit_ns,
+                                 p.command != e.command ? std::max(0.0, e.commit_ns - reach) / 1e3 : 0.0,
+                                 between, name(p).c_str(), name(e).c_str());
+                }
             }
             if (r->end > reach) {
                 busy += (r->end - std::max(reach, r->start)) / 1e6;
@@ -706,14 +729,19 @@ void Report() {
     for (size_t i = 0; i < std::min<size_t>(12, g.size()); ++i) {
         std::printf("    %7.3f %6.1f  %s\n", g[i].second.ms / n, g[i].second.encoders / n, g[i].first.c_str());
     }
+    if (gap_file) {
+        std::fflush(gap_file);
+    }
+    std::printf("  of the idle, %.2f ms/frame came before the next command buffer was committed (the GPU "
+                "waited for the CPU)\n", commit_late / n);
     std::printf("  largest idle by the encoders on either side and what separates them (ms/frame, "
-                "gaps/frame, us per gap):\n");
+                "gaps/frame, us per gap, ms/frame of it before the next commit):\n");
     std::vector<std::pair<std::string, Sum>> pg(gap_pairs.begin(), gap_pairs.end());
     std::sort(pg.begin(), pg.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     for (size_t i = 0; i < std::min<size_t>(25, pg.size()); ++i) {
         const Sum& v = pg[i].second;
-        std::printf("    %7.3f %6.1f %6.0f  %s\n", v.ms / n, v.encoders / n,
-                    v.encoders ? 1000.0 * v.ms / v.encoders : 0.0, pg[i].first.c_str());
+        std::printf("    %7.3f %6.1f %6.0f %7.3f  %s\n", v.ms / n, v.encoders / n,
+                    v.encoders ? 1000.0 * v.ms / v.encoders : 0.0, v.work / n, pg[i].first.c_str());
     }
 }
 
