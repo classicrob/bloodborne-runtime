@@ -24,6 +24,7 @@
 #include "video_core/renderer_metal/mtl_shadow.h"
 #include "video_core/renderer_metal/mtl_tessellation.h"
 #include "video_core/renderer_metal/mtl_geometry.h"
+#include "video_core/renderer_metal/mtl_gpu_timing.h"
 #include "video_core/renderer_metal/vk_to_mtl.h"
 
 namespace MetalFrame {
@@ -249,7 +250,10 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
         [o.blit endEncoding];
         o.blit = nil;
     }
-    o.render = [o.cmd renderCommandEncoderWithDescriptor:o.pass_opened ? o.pass : o.pass_first];
+    MTLRenderPassDescriptor* descriptor = o.pass_opened ? o.pass : o.pass_first;
+    MetalGpuTiming::AttachRender(o.timing, descriptor, "pass");
+    o.render = [o.cmd renderCommandEncoderWithDescriptor:descriptor];
+    MetalGpuTiming::DetachRender(descriptor);
     o.pass_opened = true;
     o.cache = {};
     if (o.render) {
@@ -263,7 +267,11 @@ id<MTLComputeCommandEncoder> ComputeEncoder(Owned& o) {
         return o.compute;
     }
     EndEncoders(o);
-    o.compute = [o.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    if (MTLComputePassDescriptor* timed = MetalGpuTiming::ComputePass(o.timing)) {
+        o.compute = [o.cmd computeCommandEncoderWithDescriptor:timed]; // BB_METAL_GPU_TIMING
+    } else {
+        o.compute = [o.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    }
     UseAddressBuffers(o.compute, false);
     return o.compute;
 }
@@ -273,7 +281,11 @@ id<MTLBlitCommandEncoder> BlitEncoder(Owned& o) {
         return o.blit;
     }
     EndEncoders(o);
-    o.blit = [o.cmd blitCommandEncoder];
+    if (MTLBlitPassDescriptor* timed = MetalGpuTiming::BlitPass(o.timing)) {
+        o.blit = [o.cmd blitCommandEncoderWithDescriptor:timed]; // BB_METAL_GPU_TIMING
+    } else {
+        o.blit = [o.cmd blitCommandEncoder];
+    }
     return o.blit;
 }
 
@@ -716,6 +728,7 @@ void Init(VkDevice dev, id<MTLCommandQueue> q, PFN_vkExportMetalObjectsEXT expor
     vk_device = dev;
     queue = q;
     device = q.device;
+    MetalGpuTiming::Init(device);
     export_objects = export_fn;
     get_address = address_fn;
     get_mtl_buffer = export_fn ? FindGetMTLBuffer() : nullptr;
@@ -790,6 +803,7 @@ void CommitChunk(Owned& o) {
           keep.clear();
         }];
     }
+    MetalGpuTiming::Commit(o.timing, o.cmd);
     [o.cmd commit];
     o.cmd = [queue commandBufferWithUnretainedReferences];
     o.cmd.label = @"bbport Metal path";
@@ -1599,6 +1613,9 @@ void GeometryDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 vertex
     }
     ++stats.draws;
     ++o.chunk_draws;
+    MetalGpuTiming::NoteWork(o.timing, o.graphics && o.graphics->render
+                                           ? (__bridge id<MTLFunction>)o.graphics->render->vertex_function
+                                           : nil);
 }
 } // namespace
 
@@ -1658,6 +1675,9 @@ void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 
                 baseInstance:first_instance];
     ++stats.draws;
     ++o.chunk_draws;
+    MetalGpuTiming::NoteWork(o.timing, o.graphics && o.graphics->render
+                                           ? (__bridge id<MTLFunction>)o.graphics->render->vertex_function
+                                           : nil);
 }
 
 void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
@@ -1698,6 +1718,9 @@ void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
                        baseInstance:first_instance];
     ++stats.draws;
     ++o.chunk_draws;
+    MetalGpuTiming::NoteWork(o.timing, o.graphics && o.graphics->render
+                                           ? (__bridge id<MTLFunction>)o.graphics->render->vertex_function
+                                           : nil);
 }
 
 void DrawIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset, u32 count, u32 stride,
@@ -1743,6 +1766,7 @@ void Dispatch(Owned& o, u32 x, u32 y, u32 z) {
         threadsPerThreadgroup:MTLSizeMake(p->threads_per_group[0], p->threads_per_group[1],
                                           p->threads_per_group[2])];
     ++stats.dispatches;
+    MetalGpuTiming::NoteWork(o.timing, p->shader ? p->shader->entry.c_str() : nullptr);
 }
 
 void DispatchIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset) {
@@ -1761,6 +1785,7 @@ void DispatchIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset) {
                                                             p->threads_per_group[1],
                                                             p->threads_per_group[2])];
     ++stats.dispatches;
+    MetalGpuTiming::NoteWork(o.timing, p->shader ? p->shader->entry.c_str() : nullptr);
 }
 
 void CopyBuffer(Owned& o, VkBuffer src, VkBuffer dst, u32 count, const VkBufferCopy* regions) {
@@ -1891,6 +1916,7 @@ void ClearColorImage(Owned& o, VkImage image, const VkClearColorValue* color, u3
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(
             color->float32[0], color->float32[1], color->float32[2], color->float32[3]);
+        MetalGpuTiming::AttachRender(o.timing, rp, "clear");
         [[o.cmd renderCommandEncoderWithDescriptor:rp] endEncoding];
     });
 }
@@ -1921,6 +1947,7 @@ void ClearDepthStencilImage(Owned& o, VkImage image, const VkClearDepthStencilVa
             rp.stencilAttachment.storeAction = MTLStoreActionStore;
             rp.stencilAttachment.clearStencil = value->stencil;
         }
+        MetalGpuTiming::AttachRender(o.timing, rp, "clear");
         [[o.cmd renderCommandEncoderWithDescriptor:rp] endEncoding];
     });
 }
@@ -2037,7 +2064,9 @@ void BlitImage(Owned& o, VkImage src_image, VkImage dst_image, u32 count,
             rp.stencilAttachment.loadAction = MTLLoadActionLoad;
             rp.stencilAttachment.storeAction = MTLStoreActionStore;
         }
+        MetalGpuTiming::AttachRender(o.timing, rp, "copy draw");
         id<MTLRenderCommandEncoder> enc = [o.cmd renderCommandEncoderWithDescriptor:rp];
+        MetalGpuTiming::NoteWork(o.timing);
         [enc setRenderPipelineState:pipeline];
         if (is_depth) {
             static id<MTLDepthStencilState> write_always = [] {

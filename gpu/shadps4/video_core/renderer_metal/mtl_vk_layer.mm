@@ -26,6 +26,7 @@
 // structs break vulkan.hpp; the C header alone is fine).
 #include <vulkan/vulkan_metal.h>
 #include "video_core/renderer_metal/mtl_frame.h"
+#include "video_core/renderer_metal/mtl_gpu_timing.h"
 #include "video_core/renderer_metal/mtl_shadow.h"
 #include "video_core/renderer_vulkan/vk_metal_shadow.h"
 
@@ -263,6 +264,7 @@ void OwnBuffer(VkCommandBuffer cb) {
     o->cmd.label = @"bbport Metal path";
     std::scoped_lock lock{owned_mutex};
     if (auto it = owned.find(cb); it != owned.end()) {
+        MetalGpuTiming::Drop(it->second->timing);
         delete it->second; // begun again without a submit (reset)
         it->second = o;
     } else {
@@ -308,6 +310,7 @@ bool IsOurPool(VkCommandPool pool) {
 void DropOwned(VkCommandBuffer cb) {
     std::scoped_lock lock{owned_mutex};
     if (auto it = owned.find(cb); it != owned.end()) {
+        MetalGpuTiming::Drop(it->second->timing);
         delete it->second;
         owned.erase(it);
         owned_count.store(unsigned(owned.size()), std::memory_order_release);
@@ -443,6 +446,7 @@ void CommitOwned(uint32_t count, Get&& get, const std::vector<EventSignal>* sign
               keep.clear();
             }];
         }
+        MetalGpuTiming::Commit(o->timing, o->cmd);
         [o->cmd commit];
         }
         static std::atomic<unsigned long long> committed{0};
