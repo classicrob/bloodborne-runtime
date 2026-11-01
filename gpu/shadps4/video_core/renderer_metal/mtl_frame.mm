@@ -2,6 +2,7 @@
 // From Wooloomooloo2/bloodborne_mac_port (78b59f5, GPL-2.0-or-later), adapted to bloodborne-runtime.
 
 #include <dlfcn.h>
+#include "bbport_toggles.h"
 #include <xxhash.h>
 #include <mach-o/dyld.h>
 #include <algorithm>
@@ -19,6 +20,7 @@
 #include <vulkan/vulkan_metal.h>
 #include "video_core/renderer_metal/mtl_depth_stencil.h"
 #include "video_core/renderer_metal/mtl_pso_cache.h"
+#include "video_core/renderer_vulkan/vk_pipeline_key.h"
 #include "video_core/renderer_metal/mtl_raster_util.h"
 #include "video_core/renderer_metal/mtl_shader.h"
 #include "video_core/renderer_metal/mtl_shadow.h"
@@ -214,6 +216,12 @@ void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
         return;
     }
     std::vector<id<MTLResource>> resources(declared_buffers.begin(), declared_buffers.end());
+    // Experiment bit 13 (PROBE ONLY, unsafe: drops the ordering of compute writes before
+    // draws): render encoders do not declare the guest memory (it stays resident through the
+    // residency set), to measure whether the declarations make dependent passes wait longer.
+    if (render && BbToggle::Experiment(1ull << 13)) {
+        return;
+    }
     if (render) {
         // Render passes read guest memory through pointers; writes come from compute. Declaring
         // them writers too made every pass wait for the one before (no vertex/fragment overlap).
@@ -228,10 +236,113 @@ void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
                    usage:writes ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead
                   stages:MTLRenderStageVertex | MTLRenderStageFragment];
     } else {
-        [(id<MTLComputeCommandEncoder>)encoder useResources:resources.data()
-                                                      count:resources.size()
-                                                      usage:MTLResourceUsageRead |
-                                                            MTLResourceUsageWrite];
+        // Experiment bit 11 (PROBE ONLY, unsafe: drops real ordering): compute encoders declare
+        // the guest memory read-only, so Metal no longer serializes them against the render
+        // encoders around them. Measures how much of the idle between encoders this ordering is.
+        const bool probe = BbToggle::Experiment(1ull << 11);
+        [(id<MTLComputeCommandEncoder>)encoder
+            useResources:resources.data()
+                   count:resources.size()
+                   usage:probe ? MTLResourceUsageRead : MTLResourceUsageRead | MTLResourceUsageWrite];
+    }
+}
+
+u64 AttachmentBytes(MTLRenderPassAttachmentDescriptor* a);
+void DumpRender(Owned& o, MTLRenderPassDescriptor* rp, const char* kind);
+void DumpOpen(Owned& o, const char* kind);
+void DumpClose(Owned& o);
+void DumpRead(Owned& o, id<MTLTexture> t);
+void DumpWrite(Owned& o, id<MTLTexture> t);
+
+/// BB_METAL_PASS_STATS=1: a render encoder's load and store actions and the attachment memory
+/// they read and write (whole attachments: a tile-based GPU loads and stores them all).
+void NoteRenderEncoder(MTLRenderPassDescriptor* rp, bool reopened) {
+    ++stats.render_encoders;
+    if (reopened) {
+        ++stats.render_reopened;
+    }
+    const auto note = [&](MTLRenderPassAttachmentDescriptor* a, int kind) {
+        if (!a.texture) {
+            return;
+        }
+        const int load = a.loadAction == MTLLoadActionLoad ? 0 : a.loadAction == MTLLoadActionClear ? 1 : 2;
+        ++stats.loads[kind][load];
+        ++stats.stores[kind][a.storeAction == MTLStoreActionDontCare ? 1 : 0];
+        const u64 bytes = AttachmentBytes(a);
+        if (load == 0) {
+            stats.load_bytes += bytes;
+            if (reopened) {
+                stats.reopen_load_bytes += bytes;
+            }
+        }
+        if (a.storeAction != MTLStoreActionDontCare) {
+            stats.store_bytes += bytes;
+        }
+    };
+    for (u32 i = 0; i < 8; ++i) {
+        note(rp.colorAttachments[i], 0);
+    }
+    note(rp.depthAttachment, 1);
+    // A combined depth-stencil texture is counted once (with its depth).
+    if (rp.stencilAttachment.texture != rp.depthAttachment.texture) {
+        note(rp.stencilAttachment, 2);
+    } else if (rp.stencilAttachment.texture) {
+        const auto* a = rp.stencilAttachment;
+        ++stats.loads[2][a.loadAction == MTLLoadActionLoad ? 0 : a.loadAction == MTLLoadActionClear ? 1 : 2];
+        ++stats.stores[2][a.storeAction == MTLStoreActionDontCare ? 1 : 0];
+    }
+}
+
+/// Experiment bit 12: the first draw of a pass that loads its one colour target (no depth or
+/// stencil) is a rect list without blending that writes every channel over a viewport and
+/// scissor covering the whole target, so nothing loaded survives: the pass loads nothing
+/// (DontCare). Full-screen passes like the glare/bloom pyramid. The rect itself is assumed to
+/// cover the viewport (as the game's full-screen rects do); frame dumps prove it.
+void SkipOverwrittenLoad(Owned& o, MTLRenderPassDescriptor* rp) {
+    if (!BbToggle::Experiment(1ull << 12) || !o.graphics || !o.graphics->rect_list ||
+        !o.graphics->render || rp.depthAttachment.texture || rp.stencilAttachment.texture) {
+        return;
+    }
+    MTLRenderPassColorAttachmentDescriptor* c = rp.colorAttachments[0];
+    if (!c.texture || c.loadAction != MTLLoadActionLoad) {
+        return;
+    }
+    for (u32 i = 1; i < 8; ++i) {
+        if (rp.colorAttachments[i].texture) {
+            return;
+        }
+    }
+    const auto& key = o.graphics->render->key;
+    using Mask = VideoCore::Backend::ColorWriteMask;
+    const u32 mask = u32(key.write_masks[0]);
+    const MTLPixelFormat f = c.texture.pixelFormat;
+    const u32 needed = f == MTLPixelFormatRG11B10Float || f == MTLPixelFormatRGB9E5Float
+                           ? u32(Mask::R) | u32(Mask::G) | u32(Mask::B)
+                           : u32(Mask::All);
+    if ((mask & needed) != needed || Vulkan::AttachmentBlendState(key, 0).enable) {
+        return;
+    }
+    const double w = double(std::max<NSUInteger>(1, c.texture.width >> c.level));
+    const double h = double(std::max<NSUInteger>(1, c.texture.height >> c.level));
+    if (o.viewports.empty()) {
+        return;
+    }
+    const VkViewport& v = o.viewports[0];
+    const double vx0 = std::min(v.x, v.x + v.width), vx1 = std::max(v.x, v.x + v.width);
+    const double vy0 = std::min(v.y, v.y + v.height), vy1 = std::max(v.y, v.y + v.height);
+    if (vx0 > 0 || vy0 > 0 || vx1 < w || vy1 < h) {
+        return;
+    }
+    if (!o.scissors.empty()) {
+        const VkRect2D& r = o.scissors[0];
+        if (r.offset.x > 0 || r.offset.y > 0 || r.offset.x + double(r.extent.width) < w ||
+            r.offset.y + double(r.extent.height) < h) {
+            return;
+        }
+    }
+    c.loadAction = MTLLoadActionDontCare;
+    if (PassStats()) {
+        ++stats.loads_skipped;
     }
 }
 
@@ -243,12 +354,23 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
         return o.render;
     }
     if (o.compute) {
+        DumpClose(o);
         [o.compute endEncoding];
         o.compute = nil;
     }
     if (o.blit) {
+        DumpClose(o);
         [o.blit endEncoding];
         o.blit = nil;
+    }
+    if (!o.pass_opened) {
+        SkipOverwrittenLoad(o, o.pass_first);
+    }
+    if (PassStats()) {
+        NoteRenderEncoder(o.pass_opened ? o.pass : o.pass_first, o.pass_opened);
+    }
+    if (PassDumpRecording()) {
+        DumpRender(o, o.pass_opened ? o.pass : o.pass_first, o.pass_opened ? "R reopened" : "R");
     }
     MTLRenderPassDescriptor* descriptor = o.pass_opened ? o.pass : o.pass_first;
     MetalGpuTiming::AttachRender(o.timing, descriptor, "pass");
@@ -267,6 +389,12 @@ id<MTLComputeCommandEncoder> ComputeEncoder(Owned& o) {
         return o.compute;
     }
     EndEncoders(o);
+    if (PassStats()) {
+        ++stats.compute_encoders;
+    }
+    if (PassDumpRecording()) {
+        DumpOpen(o, "C");
+    }
     if (MTLComputePassDescriptor* timed = MetalGpuTiming::ComputePass(o.timing)) {
         o.compute = [o.cmd computeCommandEncoderWithDescriptor:timed]; // BB_METAL_GPU_TIMING
     } else {
@@ -278,14 +406,22 @@ id<MTLComputeCommandEncoder> ComputeEncoder(Owned& o) {
 
 id<MTLBlitCommandEncoder> BlitEncoder(Owned& o) {
     if (o.blit) {
+        ++o.dump_count;
         return o.blit;
     }
     EndEncoders(o);
+    if (PassStats()) {
+        ++stats.blit_encoders;
+    }
+    if (PassDumpRecording()) {
+        DumpOpen(o, "B");
+    }
     if (MTLBlitPassDescriptor* timed = MetalGpuTiming::BlitPass(o.timing)) {
         o.blit = [o.cmd blitCommandEncoderWithDescriptor:timed]; // BB_METAL_GPU_TIMING
     } else {
         o.blit = [o.cmd blitCommandEncoder];
     }
+    o.dump_count = 1;
     return o.blit;
 }
 
@@ -342,6 +478,7 @@ void SetBytes(Owned& o, Stage stage, const void* bytes, u64 length, u32 index) {
 }
 
 void SetTexture(Owned& o, Stage stage, id<MTLTexture> texture, u32 index) {
+    DumpRead(o, texture);
     if (stage != Stage::Compute && index < o.cache.textures[0].size()) {
         void*& slot = o.cache.textures[stage == Stage::Fragment][index];
         if (slot == (__bridge void*)texture) {
@@ -448,6 +585,7 @@ bool PrepareDraw(Owned& o) {
         Log("a draw outside a render pass (skipped)");
         return false;
     }
+    ++o.dump_count;
     const auto* entry = o.graphics.get();
     if (!entry || !entry->render) {
         ++stats.skipped_no_pipeline;
@@ -656,6 +794,17 @@ Block BlockOf(MTLPixelFormat f) {
     }
 }
 
+u64 AttachmentBytes(MTLRenderPassAttachmentDescriptor* a) {
+    id<MTLTexture> t = a.texture;
+    MTLPixelFormat f = t.pixelFormat;
+    u32 bytes = BlockOf(f).bytes;
+    if (!bytes) {
+        bytes = f == MTLPixelFormatDepth32Float_Stencil8 ? 5 : f == MTLPixelFormatDepth24Unorm_Stencil8 ? 4 : 4;
+    }
+    const u64 w = std::max<NSUInteger>(1, t.width >> a.level), h = std::max<NSUInteger>(1, t.height >> a.level);
+    return w * h * bytes * std::max<NSUInteger>(1, t.sampleCount);
+}
+
 void BufferImageCopy(Owned& o, BufferRef buffer, id<MTLTexture> texture,
                      const VkBufferImageCopy& r, bool to_image) {
     MTLPixelFormat format = texture.pixelFormat;
@@ -680,6 +829,11 @@ void BufferImageCopy(Owned& o, BufferRef buffer, id<MTLTexture> texture,
     const MTLSize size = MTLSizeMake(r.imageExtent.width, r.imageExtent.height, r.imageExtent.depth);
     const MTLOrigin origin = MTLOriginMake(r.imageOffset.x, r.imageOffset.y, r.imageOffset.z);
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
+    if (to_image) {
+        DumpWrite(o, texture);
+    } else {
+        DumpRead(o, texture);
+    }
     for (u32 layer = 0; layer < r.imageSubresource.layerCount; ++layer) {
         const u64 offset = buffer.offset + r.bufferOffset + layer * bytes_per_image;
         if (to_image) {
@@ -717,6 +871,159 @@ id<MTLTexture> ImageTexture(VkImage image) {
 Stats& GetStats() {
     return stats;
 }
+
+VkImage ImageOfView(VkImageView view) {
+    std::scoped_lock lock{maps_mutex};
+    const auto it = view_infos.find(view);
+    return it != view_infos.end() ? it->second.image : VK_NULL_HANDLE;
+}
+
+bool PassStats() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_METAL_PASS_STATS");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+namespace {
+const char* pass_dump_path = std::getenv("BB_METAL_PASS_DUMP");
+std::atomic<int> pass_dump_state{0}; ///< 0 off, 1 recording until the next present
+std::mutex pass_dump_mutex;
+std::unordered_map<void*, u32> dump_ids; ///< texture -> its number in the dumps
+std::string dump_out;
+} // namespace
+
+bool PassDumpRecording() {
+    return pass_dump_state.load(std::memory_order_relaxed) != 0;
+}
+
+void PassDumpPresent() {
+    if (!pass_dump_path) {
+        return;
+    }
+    const std::string trigger = std::string(pass_dump_path) + ".trigger";
+    std::scoped_lock lock{pass_dump_mutex};
+    if (pass_dump_state.load() == 1) {
+        pass_dump_state = 0;
+        dump_out += "present\n";
+        if (FILE* f = std::fopen(pass_dump_path, "a")) {
+            std::fputs(dump_out.c_str(), f);
+            std::fclose(f);
+        }
+        dump_out.clear();
+        std::remove(trigger.c_str());
+        std::printf("Metal pass dump: one frame appended to %s\n", pass_dump_path);
+    } else if (FILE* t = std::fopen(trigger.c_str(), "r")) {
+        std::fclose(t);
+        pass_dump_state = 1;
+        dump_out = "frame\n";
+    }
+}
+
+void PassDumpCommit(Owned& o) {
+    if (o.dump.empty()) {
+        return;
+    }
+    std::scoped_lock lock{pass_dump_mutex};
+    if (pass_dump_state.load() == 1) {
+        dump_out += "cmd\n";
+        for (const auto& line : o.dump) {
+            dump_out += line;
+            dump_out += '\n';
+        }
+    }
+    o.dump.clear();
+}
+
+namespace {
+/// "t<n>" for a texture, with its size and format the first time it appears.
+std::string DumpTexture(id<MTLTexture> t, u32 level = 0) {
+    if (!t) {
+        return "-";
+    }
+    void* key = (__bridge void*)(t.parentTexture ? t.parentTexture : t);
+    std::scoped_lock lock{pass_dump_mutex};
+    auto [it, fresh] = dump_ids.emplace(key, u32(dump_ids.size()));
+    char b[96];
+    if (fresh) {
+        std::snprintf(b, sizeof b, "t%u[%lux%lu/f%lu/L%lu]", it->second, (unsigned long)t.width,
+                      (unsigned long)t.height, (unsigned long)t.pixelFormat,
+                      (unsigned long)t.mipmapLevelCount);
+    } else {
+        std::snprintf(b, sizeof b, "t%u", it->second);
+    }
+    std::string out = b;
+    if (level) {
+        out += "@" + std::to_string(level);
+    }
+    return out;
+}
+
+std::string DumpAttachment(MTLRenderPassAttachmentDescriptor* a, const char* name) {
+    if (!a.texture) {
+        return {};
+    }
+    const char* load = a.loadAction == MTLLoadActionLoad ? "L" : a.loadAction == MTLLoadActionClear ? "C" : "D";
+    const char* store = a.storeAction == MTLStoreActionDontCare ? "D" : "S";
+    return std::string(" ") + name + "=" + DumpTexture(a.texture, u32(a.level)) + ":" + load + store;
+}
+
+/// A render encoder's opening line: its attachments with load and store actions.
+void DumpRender(Owned& o, MTLRenderPassDescriptor* rp, const char* kind) {
+    std::string line = kind;
+    for (u32 i = 0; i < 8; ++i) {
+        char name[4] = {'c', char('0' + i), 0};
+        line += DumpAttachment(rp.colorAttachments[i], name);
+    }
+    line += DumpAttachment(rp.depthAttachment, "d");
+    line += DumpAttachment(rp.stencilAttachment, "s");
+    o.dump.push_back(std::move(line));
+    o.dump_count = 0;
+    o.dump_reads.clear();
+    o.dump_writes.clear();
+}
+
+void DumpOpen(Owned& o, const char* kind) {
+    o.dump.push_back(kind);
+    o.dump_count = 0;
+    o.dump_reads.clear();
+    o.dump_writes.clear();
+}
+
+/// The end of an encoder: what it did.
+void DumpClose(Owned& o) {
+    if (!PassDumpRecording() || o.dump.empty()) {
+        return;
+    }
+    std::string& line = o.dump.back();
+    line += " n=" + std::to_string(o.dump_count);
+    const auto list = [&](std::vector<void*>& v, const char* name) {
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        if (v.empty()) {
+            return;
+        }
+        line += std::string(" ") + name + "=";
+        for (size_t i = 0; i < v.size(); ++i) {
+            line += (i ? "," : "") + DumpTexture((__bridge id<MTLTexture>)v[i]);
+        }
+    };
+    list(o.dump_reads, "reads");
+    list(o.dump_writes, "writes");
+}
+
+void DumpRead(Owned& o, id<MTLTexture> t) {
+    if (PassDumpRecording() && t) {
+        o.dump_reads.push_back((__bridge void*)t);
+    }
+}
+void DumpWrite(Owned& o, id<MTLTexture> t) {
+    if (PassDumpRecording() && t) {
+        o.dump_writes.push_back((__bridge void*)t);
+    }
+}
+} // namespace
 
 size_t AddressBufferCount() {
     std::scoped_lock lock{maps_mutex};
@@ -762,6 +1069,9 @@ void Init(VkDevice dev, id<MTLCommandQueue> q, PFN_vkExportMetalObjectsEXT expor
 
 void EndEncoders(Owned& o) {
     FlushPending(o);
+    if (o.render || o.compute || o.blit) {
+        DumpClose(o);
+    }
     if (o.render) {
         [o.render endEncoding];
         o.render = nil;
@@ -795,6 +1105,7 @@ void ReturnScratchWhenDone(Owned& o) {
 
 void CommitChunk(Owned& o) {
     EndEncoders(o);
+    PassDumpCommit(o);
     ReturnScratchWhenDone(o);
     if (!o.keep.empty()) {
         __block std::vector<id<MTLBuffer>> keep = std::move(o.keep);
@@ -1074,6 +1385,7 @@ void Barrier(Owned& o) {
     // Tracked resources order the encoders; inside a compute encoder dispatches are serial.
     // A blit encoder is ended so the next command sees its writes.
     if (o.blit) {
+        DumpClose(o);
         [o.blit endEncoding];
         o.blit = nil;
     }
@@ -1184,6 +1496,9 @@ void BeginRendering(Owned& o, const VkRenderingInfo* info) {
     o.last_draw_tess = false;
     o.pass_first = rp;
     o.pass_opened = false;
+    if (PassStats()) {
+        ++stats.passes;
+    }
     o.pass_clears = false;
     for (u32 i = 0; i < info->colorAttachmentCount; ++i) {
         o.pass_clears |= rp.colorAttachments[i].texture &&
@@ -1208,10 +1523,14 @@ void BeginRendering(Owned& o, const VkRenderingInfo* info) {
 
 void EndRendering(Owned& o) {
     FlushPending(o);
+    if (PassStats() && !o.render && !o.pass_opened) {
+        ++(o.pass_clears ? stats.passes_clear_only : stats.passes_empty);
+    }
     if (!o.render && !o.pass_opened && o.pass_clears) {
         RenderEncoder(o); // a pass without draws still performs its clears
     }
     if (o.render) {
+        DumpClose(o);
         [o.render endEncoding];
         o.render = nil;
     }
@@ -1499,6 +1818,9 @@ void TessellatedDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 ver
                        vb.buffer ? vb.offset : 0, slot.constant || !vb.stride ? 16 : vb.stride,
                        slot.slot};
     }
+    if (PassStats() && !o.last_draw_tess) {
+        ++stats.tess_runs;
+    }
     // Steps 1 and 2: the kernels go before the pass when it has not begun, else interrupt it.
     id<MTLComputeCommandEncoder> enc = ComputeEncoder(o);
     const auto plan = Metal::Tessellation::PlanScratch(tess, patches);
@@ -1533,6 +1855,9 @@ void GeometryDraw(Owned& o, u32 count, u32 instance_count, u32 first, s32 vertex
     const u32 prims = geo.info.input_vertices ? count / geo.info.input_vertices : 0;
     if (!prims || !instance_count) {
         return;
+    }
+    if (PassStats()) {
+        ++stats.geometry_draws;
     }
     if (instance_count > 1) {
         Log("instanced geometry-shader draws draw instance 0 only");
@@ -1762,6 +2087,7 @@ void Dispatch(Owned& o, u32 x, u32 y, u32 z) {
     id<MTLComputeCommandEncoder> enc = ComputeEncoder(o);
     [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)p->state];
     BindStage(o, Stage::Compute, p->shader, o.compute_bindings);
+    ++o.dump_count;
     [enc dispatchThreadgroups:MTLSizeMake(x, y, z)
         threadsPerThreadgroup:MTLSizeMake(p->threads_per_group[0], p->threads_per_group[1],
                                           p->threads_per_group[2])];
@@ -1779,6 +2105,7 @@ void DispatchIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset) {
     id<MTLComputeCommandEncoder> enc = ComputeEncoder(o);
     [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)p->state];
     BindStage(o, Stage::Compute, p->shader, o.compute_bindings);
+    ++o.dump_count;
     [enc dispatchThreadgroupsWithIndirectBuffer:ref.buffer
                            indirectBufferOffset:ref.offset + offset
                           threadsPerThreadgroup:MTLSizeMake(p->threads_per_group[0],
@@ -1788,11 +2115,127 @@ void DispatchIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset) {
     MetalGpuTiming::NoteWork(o.timing, p->shader ? p->shader->entry.c_str() : nullptr);
 }
 
+// Vector transfers use 16 or 4 bytes per thread, with byte transfers for unaligned ranges.
+// The serial encoder orders these kernels with
+// surrounding game dispatches. Deferred patch draws must be flushed by the blit path
+// before changing their buffers. Compute bindings are never cached: Dispatch/DispatchIndirect
+// set the pipeline and BindStage rebinds every resource, including push constants, each time.
+bool CopyComputeStats() {
+    static const bool enabled = [] { const char* e = std::getenv("BB_COPY_AS_COMPUTE_STATS");
+                                     return e && e[0] == '1'; }();
+    return enabled;
+}
+static bool BufferAsCompute(Owned& o, id<MTLBuffer> src, u64 src_base,
+                            id<MTLBuffer> dst, u64 dst_base, u32 count,
+                            const VkBufferCopy* regions, u8 fill) {
+    if (!BbToggle::Experiment(1ull << 10) || !o.compute || o.render ||
+        !o.pending.empty() || !count) return false;
+    static const u64 limit = []() -> u64 {
+        const char* e = std::getenv("BB_COPY_COMPUTE_MAX");
+        return e ? std::min<u64>(std::strtoull(e, nullptr, 0), 1ull << 30) : 65536;
+    }();
+    u64 total = 0;
+    for (u32 i = 0; i < count; ++i) {
+        if (regions[i].size > limit - total) return false;
+        total += regions[i].size;
+    }
+    if (!total) return false;
+    const auto overlaps = [](u64 a, u64 n, u64 b, u64 m) {
+        return n && m && (a <= b ? b - a < n : a - b < m);
+    };
+    // A single dispatch cannot preserve cross-region read/write or write/write dependencies.
+    for (u32 i = 0; i < count; ++i) {
+        for (u32 j = 0; j < count; ++j) {
+            if (src == dst && overlaps(src_base + regions[i].srcOffset, regions[i].size,
+                                      dst_base + regions[j].dstOffset, regions[j].size)) return false;
+            if (j < i && overlaps(dst_base + regions[i].dstOffset, regions[i].size,
+                                  dst_base + regions[j].dstOffset, regions[j].size)) return false;
+        }
+    }
+    struct Region { u64 src, dst; u32 end, width; };
+    static_assert(sizeof(Region) == 24);
+    std::vector<Region> rows;
+    u32 threads = 0;
+    for (u32 i = 0; i < count; ++i) {
+        const auto& r = regions[i];
+        const u64 a = src_base + r.srcOffset, b = dst_base + r.dstOffset;
+        const u64 alignment = (src ? a : 0) | b | r.size;
+        const u32 width = !(alignment & 15) ? 16 : !(alignment & 3) ? 4 : 1;
+        threads += r.size / width;
+        rows.push_back({a, b, threads, width});
+    }
+    static id<MTLComputePipelineState> pipeline;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        NSString* source = @R"msl(
+#include <metal_stdlib>
+using namespace metal;
+struct Region { ulong src, dst; uint end, width; };
+struct Args { uint count, fill, copying; };
+kernel void buffer_vectors(device const uchar* src [[buffer(0)]],
+                           device uchar* dst [[buffer(1)]],
+                           constant Region* rows [[buffer(2)]],
+                           constant Args& a [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    uint lo = 0, hi = a.count;
+    while (lo < hi) {
+        uint mid = lo + (hi - lo) / 2;
+        if (i < rows[mid].end) hi = mid; else lo = mid + 1;
+    }
+    if (lo == a.count) return;
+    Region row = rows[lo];
+    uint start = lo ? rows[lo - 1].end : 0;
+    ulong off = ulong(i - start) * row.width;
+    uint pattern = a.fill * 0x01010101u;
+    if (row.width == 16)
+        *((device uint4*)(dst + row.dst + off)) = a.copying ?
+            *((device const uint4*)(src + row.src + off)) : uint4(pattern);
+    else if (row.width == 4)
+        *((device uint*)(dst + row.dst + off)) = a.copying ?
+            *((device const uint*)(src + row.src + off)) : pattern;
+    else dst[row.dst + off] = a.copying ? src[row.src + off] : uchar(a.fill);
+}
+)msl";
+        NSError* error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+        id<MTLFunction> function = [library newFunctionWithName:@"buffer_vectors"];
+        if (function) pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        if (!pipeline) std::printf("Metal buffer kernel: %s\n", error.localizedDescription.UTF8String);
+    });
+    if (!pipeline) return false;
+    if (src) [o.compute useResource:src usage:MTLResourceUsageRead];
+    [o.compute useResource:dst usage:src == dst ? MTLResourceUsageRead | MTLResourceUsageWrite
+                                               : MTLResourceUsageWrite];
+    [o.compute setComputePipelineState:pipeline];
+    [o.compute setBuffer:src ? src : dst offset:0 atIndex:0];
+    [o.compute setBuffer:dst offset:0 atIndex:1];
+    const size_t bytes = rows.size() * sizeof(Region);
+    if (bytes <= 4096) {
+        [o.compute setBytes:rows.data() length:bytes atIndex:2];
+    } else {
+        id<MTLBuffer> table = [device newBufferWithBytes:rows.data() length:bytes
+                                               options:MTLResourceStorageModeShared];
+        if (!table) return false;
+        o.keep.push_back(table);
+        [o.compute useResource:table usage:MTLResourceUsageRead];
+        [o.compute setBuffer:table offset:0 atIndex:2];
+    }
+    struct { u32 count, fill, copying; } args{count, fill, src != nil};
+    [o.compute setBytes:&args length:sizeof(args) atIndex:3];
+    [o.compute dispatchThreads:MTLSizeMake(threads, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
+    if (CopyComputeStats()) {
+        if (src) ++stats.compute_copies; else ++stats.compute_fills;
+        ++stats.compute_blits_avoided;
+    }
+    return true;
+}
+
 void CopyBuffer(Owned& o, VkBuffer src, VkBuffer dst, u32 count, const VkBufferCopy* regions) {
     const BufferRef s = ResolveBuffer(src), d = ResolveBuffer(dst);
     if (!s.buffer || !d.buffer) {
         return;
     }
+    if (BufferAsCompute(o, s.buffer, s.offset, d.buffer, d.offset, count, regions, 0)) return;
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
     for (u32 i = 0; i < count; ++i) {
         [blit copyFromBuffer:s.buffer
@@ -1813,6 +2256,8 @@ void FillBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, 
         Log("vkCmdFillBuffer with a pattern of different bytes (filled with its low byte)");
     }
     const u64 length = size == VK_WHOLE_SIZE ? d.buffer.length - d.offset - offset : size;
+    const VkBufferCopy region{0, 0, length};
+    if (BufferAsCompute(o, nil, 0, d.buffer, d.offset + offset, 1, &region, b)) return;
     [BlitEncoder(o) fillBuffer:d.buffer range:NSMakeRange(d.offset + offset, length) value:b];
 }
 
@@ -1826,6 +2271,8 @@ void UpdateBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size
                                                 length:size
                                                options:MTLResourceStorageModeShared];
     o.keep.push_back(staging); // the command buffer does not retain it
+    const VkBufferCopy region{0, 0, size};
+    if (BufferAsCompute(o, staging, 0, d.buffer, d.offset + offset, 1, &region, 0)) return;
     [BlitEncoder(o) copyFromBuffer:staging
                       sourceOffset:0
                           toBuffer:d.buffer
@@ -1839,6 +2286,8 @@ void CopyImage(Owned& o, VkImage src, VkImage dst, u32 count, const VkImageCopy*
         return;
     }
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
+    DumpRead(o, s);
+    DumpWrite(o, d);
     for (u32 i = 0; i < count; ++i) {
         const VkImageCopy& r = regions[i];
         for (u32 layer = 0; layer < r.srcSubresource.layerCount; ++layer) {
@@ -1916,6 +2365,12 @@ void ClearColorImage(Owned& o, VkImage image, const VkClearColorValue* color, u3
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(
             color->float32[0], color->float32[1], color->float32[2], color->float32[3]);
+        if (PassDumpRecording()) {
+            DumpRender(o, rp, "R clear-colour");
+        }
+        if (PassStats()) {
+            ++stats.clear_encoders;
+        }
         MetalGpuTiming::AttachRender(o.timing, rp, "clear");
         [[o.cmd renderCommandEncoderWithDescriptor:rp] endEncoding];
     });
@@ -1946,6 +2401,12 @@ void ClearDepthStencilImage(Owned& o, VkImage image, const VkClearDepthStencilVa
             rp.stencilAttachment.loadAction = MTLLoadActionClear;
             rp.stencilAttachment.storeAction = MTLStoreActionStore;
             rp.stencilAttachment.clearStencil = value->stencil;
+        }
+        if (PassDumpRecording()) {
+            DumpRender(o, rp, "R clear-depth");
+        }
+        if (PassStats()) {
+            ++stats.clear_encoders;
         }
         MetalGpuTiming::AttachRender(o.timing, rp, "clear");
         [[o.cmd renderCommandEncoderWithDescriptor:rp] endEncoding];
@@ -2063,6 +2524,15 @@ void BlitImage(Owned& o, VkImage src_image, VkImage dst_image, u32 count,
             rp.stencilAttachment.slice = b.dstSubresource.baseArrayLayer;
             rp.stencilAttachment.loadAction = MTLLoadActionLoad;
             rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+        if (PassDumpRecording()) {
+            DumpRender(o, rp, "R blit-image");
+            DumpRead(o, src);
+            o.dump_count = 1;
+            DumpClose(o);
+        }
+        if (PassStats()) {
+            ++stats.blit_image_encoders;
         }
         MetalGpuTiming::AttachRender(o.timing, rp, "copy draw");
         id<MTLRenderCommandEncoder> enc = [o.cmd renderCommandEncoderWithDescriptor:rp];

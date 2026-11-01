@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include "video_core/renderer_metal/mtl_frame.h"
 #include <algorithm>
 #include <cstdio>
 #include <mutex>
@@ -126,6 +127,8 @@ id<MTLRenderPipelineState> Pipeline(Passes& passes, id<MTLDevice> device, MTLPix
 } // namespace
 
 bool Present(void* layer_ptr, PresentInfo info) {
+    ++MetalFrame::GetStats().frames;
+    MetalFrame::PassDumpPresent();
     @autoreleasepool {
         CAMetalLayer* layer = (__bridge CAMetalLayer*)layer_ptr;
         id<MTLDevice> device = layer.device;
@@ -183,6 +186,7 @@ bool Present(void* layer_ptr, PresentInfo info) {
             destinationBytesPerImage:w * h * 4];
             [blit endEncoding];
         }
+        if (MetalFrame::CopyComputeStats()) ++MetalFrame::GetStats().copy_frames;
         [cmd presentDrawable:drawable];
         __block std::function<void()> on_done = std::move(info.done);
         __block std::string path = std::move(info.dump_path);

@@ -177,6 +177,14 @@ void Report() {
     since = now;
     if (frame_enabled) {
         auto& s = MetalFrame::GetStats();
+        const char* copy_stats = std::getenv("BB_COPY_AS_COMPUTE_STATS");
+        if (copy_stats && copy_stats[0] == '1') {
+            const double f = std::max<double>(1, s.copy_frames.exchange(0));
+            std::printf("Metal copy compute per frame: %.2f copies/updates, %.2f fills, %.2f blits avoided\n",
+                        s.compute_copies.exchange(0) / f, s.compute_fills.exchange(0) / f,
+                        s.compute_blits_avoided.exchange(0) / f);
+        }
+
         std::printf("Metal frame: per second: %.0f draws, %.0f dispatches; skipped: %.0f without "
                     "a Metal pipeline, %.0f tessellated, %.0f emulated topology, %.0f discarded; "
                     "%.0f unsupported commands; %zu device-address buffers declared per encoder; tessellated "
@@ -186,6 +194,40 @@ void Report() {
                     s.skipped_emulated.exchange(0) / seconds, s.skipped_discard.exchange(0) / seconds,
                     s.unsupported.exchange(0) / seconds, MetalFrame::AddressBufferCount(),
                     s.tess_draws.exchange(0) / seconds, s.tess_after_tess.exchange(0) / seconds);
+        if (MetalFrame::PassStats()) {
+            // Per frame: frames counted by the presents.
+            const double f = std::max<double>(1, s.frames.exchange(0));
+            const auto x = [&](std::atomic<u64>& v) { return double(v.exchange(0)) / f; };
+            std::printf("Metal passes per frame (%.1f FPS): %.1f render passes (%.1f without "
+                        "draws or clears, %.1f clears only); encoders: %.1f render (%.1f reopened "
+                        "after tessellation or geometry kernels), %.1f compute, %.1f blit; %.1f "
+                        "tessellation runs, %.1f geometry-shader draws; plus %.1f render encoders "
+                        "of image clears, %.1f of image blits\n",
+                        f / seconds, x(s.passes), x(s.passes_empty), x(s.passes_clear_only),
+                        x(s.render_encoders), x(s.render_reopened), x(s.compute_encoders),
+                        x(s.blit_encoders), x(s.tess_runs), x(s.geometry_draws),
+                        x(s.clear_encoders), x(s.blit_image_encoders));
+            const char* kinds[3] = {"colour", "depth", "stencil"};
+            for (int k = 0; k < 3; ++k) {
+                std::printf("Metal passes per frame: %s attachments load %.1f, clear %.1f, "
+                            "dont-care %.1f; store %.1f, dont-care %.1f\n",
+                            kinds[k], x(s.loads[k][0]), x(s.loads[k][1]), x(s.loads[k][2]),
+                            x(s.stores[k][0]), x(s.stores[k][1]));
+            }
+            std::printf("Metal passes per frame: barriers in an open pass: %.1f with image barriers "
+                        "on its attachments, %.1f with image barriers on other images only, %.1f "
+                        "after graphics-stage writes, %.1f other; %.1f kept the pass open; %.1f "
+                        "with barriers on its attachments that keep them attachments\n",
+                        x(s.barrier_images), x(s.barrier_images_off_pass),
+                        x(s.barrier_graphics_write), x(s.barrier_other), x(s.barrier_kept),
+                        x(s.barrier_layout_only));
+            std::printf("Metal passes per frame: %.1f colour loads skipped (overwritten)\n",
+                        x(s.loads_skipped));
+            std::printf("Metal passes per frame: attachments loaded %.1f MB (%.1f MB by reopened "
+                        "passes), stored %.1f MB\n",
+                        x(s.load_bytes) / 1e6, x(s.reopen_load_bytes) / 1e6,
+                        x(s.store_bytes) / 1e6);
+        }
         std::printf("Metal layer: per second: %.0f submits committed in Metal, %.0f through "
                     "MoltenVK\n",
                     metal_submits.exchange(0) / seconds, vulkan_submits.exchange(0) / seconds);
@@ -438,6 +480,7 @@ void CommitOwned(uint32_t count, Get&& get, const std::vector<EventSignal>* sign
             }
             CompleteFence(o->cmd, fence);
         }
+        MetalFrame::PassDumpCommit(*o);
         MetalFrame::ReturnScratchWhenDone(*o);
         if (!o->keep.empty()) {
             // Our temporary buffers live until the GPU is done with them.
@@ -1181,6 +1224,27 @@ bool PresentEnabled() {
 
 bool FrameEnabled() {
     return frame_enabled;
+}
+
+bool PassStats() {
+    return MetalFrame::PassStats();
+}
+
+unsigned long long ImageOfView(unsigned long long view) {
+    return (unsigned long long)MetalFrame::ImageOfView(VkImageView(view));
+}
+
+void NoteBarrierInPass(int kind, bool kept) {
+    auto& s = MetalFrame::GetStats();
+    if (kind == 4) {
+        ++s.barrier_layout_only;
+        return;
+    }
+    ++(kind == 0   ? s.barrier_images
+       : kind == 3 ? s.barrier_images_off_pass
+       : kind == 1 ? s.barrier_graphics_write
+                   : s.barrier_other);
+    s.barrier_kept += kept;
 }
 
 void* MetalOnlyPipeline(const void* graphics_info, const void* compute_info) {
