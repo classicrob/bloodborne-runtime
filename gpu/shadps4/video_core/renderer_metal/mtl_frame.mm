@@ -2137,10 +2137,13 @@ static bool BufferAsCompute(Owned& o, id<MTLBuffer> src, u64 src_base,
                             const VkBufferCopy* regions, u8 fill) {
     if (!BbToggle::Experiment(1ull << 10) || !o.compute || o.render ||
         !o.pending.empty() || !count) return false;
-    static const u64 limit = []() -> u64 {
+    static const u64 env_limit = []() -> u64 {
         const char* e = std::getenv("BB_COPY_COMPUTE_MAX");
         return e ? std::min<u64>(std::strtoull(e, nullptr, 0), 1ull << 30) : 65536;
     }();
+    // Experiment bit 14: transfers up to 8 MiB too (the blits right after compute kernels).
+    const u64 limit = BbToggle::Experiment(1ull << 14) ? std::max<u64>(env_limit, 8ull << 20)
+                                                       : env_limit;
     u64 total = 0;
     for (u32 i = 0; i < count; ++i) {
         if (regions[i].size > limit - total) return false;
