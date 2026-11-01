@@ -83,6 +83,7 @@ struct Owned {
     unsigned commands{};
     // BB_METAL_PASS_DUMP: this command buffer's encoders, one line each, while a dump records.
     std::vector<std::string> dump;
+    std::vector<void*> blit_textures; ///< canonical textures touched by the open blit
     u32 dump_count{};                ///< draws, dispatches or blit commands of the open encoder
     std::vector<void*> dump_reads;   ///< textures it bound (sampled, read or copied from)
     std::vector<void*> dump_writes;  ///< textures a blit wrote
@@ -214,7 +215,7 @@ void ImageGone(VkImage image);
 bool MakeView(VkImageView view, const VkImageViewCreateInfo* info);
 
 // Commands.
-void Barrier(Owned& o);
+void Barrier(Owned& o, const VkDependencyInfo* info = nullptr);
 void BeginRendering(Owned& o, const VkRenderingInfo* info);
 void EndRendering(Owned& o);
 void BindPipeline(Owned& o, VkPipelineBindPoint point, VkPipeline pipeline);

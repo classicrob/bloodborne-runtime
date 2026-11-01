@@ -217,12 +217,6 @@ void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
         return;
     }
     std::vector<id<MTLResource>> resources(declared_buffers.begin(), declared_buffers.end());
-    // Experiment bit 13 (PROBE ONLY, unsafe: drops the ordering of compute writes before
-    // draws): render encoders do not declare the guest memory (it stays resident through the
-    // residency set), to measure whether the declarations make dependent passes wait longer.
-    if (render && BbToggle::Experiment(1ull << 13)) {
-        return;
-    }
     if (render) {
         // Render passes read guest memory through pointers; writes come from compute. Declaring
         // them writers too made every pass wait for the one before (no vertex/fragment overlap).
@@ -456,6 +450,7 @@ id<MTLBlitCommandEncoder> BlitEncoder(Owned& o) {
         o.blit = [o.cmd blitCommandEncoder];
     }
     o.dump_count = 1;
+    o.blit_textures.clear();
     FenceNonrenderStart(o, o.blit);
     return o.blit;
 }
@@ -864,6 +859,7 @@ void BufferImageCopy(Owned& o, BufferRef buffer, id<MTLTexture> texture,
     const MTLSize size = MTLSizeMake(r.imageExtent.width, r.imageExtent.height, r.imageExtent.depth);
     const MTLOrigin origin = MTLOriginMake(r.imageOffset.x, r.imageOffset.y, r.imageOffset.z);
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
+    if (PassDumpRecording()) o.dump.back() += to_image ? " op=UploadImage" : " op=DownloadImage";
     if (to_image) {
         DumpWrite(o, texture);
     } else {
@@ -977,7 +973,10 @@ std::string DumpTexture(id<MTLTexture> t, u32 level = 0) {
     if (!t) {
         return "-";
     }
-    void* key = (__bridge void*)(t.parentTexture ? t.parentTexture : t);
+    while (t.parentTexture) {
+        t = t.parentTexture;
+    }
+    void* key = (__bridge void*)t;
     std::scoped_lock lock{pass_dump_mutex};
     auto [it, fresh] = dump_ids.emplace(key, u32(dump_ids.size()));
     char b[96];
@@ -1049,11 +1048,27 @@ void DumpClose(Owned& o) {
 }
 
 void DumpRead(Owned& o, id<MTLTexture> t) {
+    if (o.blit && t) {
+        while (t.parentTexture) {
+            t = t.parentTexture;
+        }
+        void* key = (__bridge void*)t;
+        if (std::find(o.blit_textures.begin(), o.blit_textures.end(), key) == o.blit_textures.end())
+            o.blit_textures.push_back(key);
+    }
     if (PassDumpRecording() && t) {
         o.dump_reads.push_back((__bridge void*)t);
     }
 }
 void DumpWrite(Owned& o, id<MTLTexture> t) {
+    if (o.blit && t) {
+        while (t.parentTexture) {
+            t = t.parentTexture;
+        }
+        void* key = (__bridge void*)t;
+        if (std::find(o.blit_textures.begin(), o.blit_textures.end(), key) == o.blit_textures.end())
+            o.blit_textures.push_back(key);
+    }
     if (PassDumpRecording() && t) {
         o.dump_writes.push_back((__bridge void*)t);
     }
@@ -1432,7 +1447,51 @@ void DeviceAddressTaken(VkBuffer buffer) {
     }
 }
 
-void Barrier(Owned& o) {
+void Barrier(Owned& o, const VkDependencyInfo* info) {
+    // Only image-scoped dependencies disjoint from ALL textures touched by this encoder
+    // can pass through it. Unknown/global/buffer dependencies and aliases stay conservative.
+    bool independent = info && !info->memoryBarrierCount && !info->bufferMemoryBarrierCount &&
+                       info->imageMemoryBarrierCount && o.render_fences.empty();
+    if (independent) {
+        for (u32 i = 0; i < info->imageMemoryBarrierCount; ++i) {
+            id<MTLTexture> t = TextureOfImage(info->pImageMemoryBarriers[i].image);
+            while (t.parentTexture) {
+                t = t.parentTexture;
+            }
+            void* key = (__bridge void*)t;
+            if (!key || std::find(o.blit_textures.begin(), o.blit_textures.end(), key) !=
+                            o.blit_textures.end()) {
+                independent = false;
+            }
+        }
+    }
+    if (o.blit && PassDumpRecording() && !o.dump.empty()) {
+        o.dump.back() += std::string(" barrier=") + (independent ? "disjoint" : "dependent-or-global");
+        if (info) {
+            o.dump.back() += ":m" + std::to_string(info->memoryBarrierCount) +
+                             ":b" + std::to_string(info->bufferMemoryBarrierCount) +
+                             ":i" + std::to_string(info->imageMemoryBarrierCount);
+            for (u32 i = 0; i < info->memoryBarrierCount; ++i) {
+                const auto& b = info->pMemoryBarriers[i];
+                o.dump.back() += ":globalSrcStage" + std::to_string(b.srcStageMask) +
+                    ":globalSrcAccess" + std::to_string(b.srcAccessMask) +
+                    ":globalDstStage" + std::to_string(b.dstStageMask) +
+                    ":globalDstAccess" + std::to_string(b.dstAccessMask);
+            }
+            for (u32 i = 0; i < info->imageMemoryBarrierCount; ++i) {
+                const auto& b = info->pImageMemoryBarriers[i];
+                o.dump.back() += " image=" + DumpTexture(TextureOfImage(b.image)) +
+                    ":srcStage" + std::to_string(b.srcStageMask) +
+                    ":srcAccess" + std::to_string(b.srcAccessMask) +
+                    ":dstStage" + std::to_string(b.dstStageMask) +
+                    ":dstAccess" + std::to_string(b.dstAccessMask);
+            }
+        }
+    }
+    if (o.blit && independent && BbToggle::Experiment(1ull << 13)) {
+        return;
+    }
+
     // Tracked resources order the encoders; inside a compute encoder dispatches are serial.
     // A blit encoder is ended so the next command sees its writes.
     o.war_pending = true; // experiment bit 9: the next compute/blit encoder waits for renders
@@ -2303,6 +2362,7 @@ void CopyBuffer(Owned& o, VkBuffer src, VkBuffer dst, u32 count, const VkBufferC
     }
     if (BufferAsCompute(o, s.buffer, s.offset, d.buffer, d.offset, count, regions, 0)) return;
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
+    if (PassDumpRecording()) o.dump.back() += " op=CopyBuffer";
     for (u32 i = 0; i < count; ++i) {
         [blit copyFromBuffer:s.buffer
                  sourceOffset:s.offset + regions[i].srcOffset
@@ -2324,7 +2384,9 @@ void FillBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, 
     const u64 length = size == VK_WHOLE_SIZE ? d.buffer.length - d.offset - offset : size;
     const VkBufferCopy region{0, 0, length};
     if (BufferAsCompute(o, nil, 0, d.buffer, d.offset + offset, 1, &region, b)) return;
-    [BlitEncoder(o) fillBuffer:d.buffer range:NSMakeRange(d.offset + offset, length) value:b];
+    auto blit = BlitEncoder(o);
+    if (PassDumpRecording()) o.dump.back() += " op=FillBuffer";
+    [blit fillBuffer:d.buffer range:NSMakeRange(d.offset + offset, length) value:b];
 }
 
 void UpdateBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size,
@@ -2339,7 +2401,9 @@ void UpdateBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size
     o.keep.push_back(staging); // the command buffer does not retain it
     const VkBufferCopy region{0, 0, size};
     if (BufferAsCompute(o, staging, 0, d.buffer, d.offset + offset, 1, &region, 0)) return;
-    [BlitEncoder(o) copyFromBuffer:staging
+    auto blit = BlitEncoder(o);
+    if (PassDumpRecording()) o.dump.back() += " op=UpdateBuffer";
+    [blit copyFromBuffer:staging
                       sourceOffset:0
                           toBuffer:d.buffer
                  destinationOffset:d.offset + offset
@@ -2352,6 +2416,7 @@ void CopyImage(Owned& o, VkImage src, VkImage dst, u32 count, const VkImageCopy*
         return;
     }
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
+    if (PassDumpRecording()) o.dump.back() += " op=CopyImage";
     DumpRead(o, s);
     DumpWrite(o, d);
     for (u32 i = 0; i < count; ++i) {
@@ -2449,6 +2514,7 @@ bool ClearByCopy(Owned& o, id<MTLTexture> texture, const VkClearColorValue* colo
         pattern = slot;
     }
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
+    if (PassDumpRecording()) o.dump.back() += " op=ClearByCopy";
     DumpWrite(o, texture);
     ForEachSubresource(texture, count, ranges, [&](u32, u32 level, u32 layer) {
         const NSUInteger lw = std::max<NSUInteger>(1, w >> level), lh = std::max<NSUInteger>(1, h >> level);

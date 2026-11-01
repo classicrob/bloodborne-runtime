@@ -516,8 +516,10 @@ public:
                                         1, reinterpret_cast<const VkImageSubresourceRange*>(&range));
         });
     }
-    void Barrier(vk::CommandBuffer cmd, const vk::DependencyInfo&) const override {
-        Encode(cmd, [](MetalFrame::Owned& o) { MetalFrame::Barrier(o); });
+    void Barrier(vk::CommandBuffer cmd, const vk::DependencyInfo& info) const override {
+        Encode(cmd, [&](MetalFrame::Owned& o) {
+            MetalFrame::Barrier(o, reinterpret_cast<const VkDependencyInfo*>(&info));
+        });
     }
     void BeginRendering(vk::CommandBuffer cmd, const vk::RenderingInfo& info) const override {
         static_assert(sizeof(vk::RenderingInfo) == sizeof(VkRenderingInfo));
