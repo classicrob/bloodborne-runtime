@@ -2203,16 +2203,39 @@ static bool BufferAsCompute(Owned& o, id<MTLBuffer> src, u64 src_base,
         total += regions[i].size;
     }
     if (!total) return false;
-    const auto overlaps = [](u64 a, u64 n, u64 b, u64 m) {
-        return n && m && (a <= b ? b - a < n : a - b < m);
-    };
     // A single dispatch cannot preserve cross-region read/write or write/write dependencies.
+    // Checked by sorting, not pairwise: a copy-shader call can carry thousands of small regions,
+    // and comparing every pair of them on the recording thread stalled frames (the periodic
+    // ~65 ms hitch Measurement found with bit 10 on macOS 27.2). Very long lists stay blits.
+    if (count > 1024) return false;
+    {
+        static std::atomic<u32> largest{0};
+        if (count > largest.load(std::memory_order_relaxed)) {
+            largest.store(count, std::memory_order_relaxed);
+            std::printf("Copies as compute: a call with %u regions (largest so far)\n", count);
+        }
+    }
+    using Span = std::pair<u64, u64>; // [start, end)
+    std::vector<Span> writes, reads;
+    writes.reserve(count);
     for (u32 i = 0; i < count; ++i) {
-        for (u32 j = 0; j < count; ++j) {
-            if (src == dst && overlaps(src_base + regions[i].srcOffset, regions[i].size,
-                                      dst_base + regions[j].dstOffset, regions[j].size)) return false;
-            if (j < i && overlaps(dst_base + regions[i].dstOffset, regions[i].size,
-                                  dst_base + regions[j].dstOffset, regions[j].size)) return false;
+        const u64 d = dst_base + regions[i].dstOffset;
+        writes.push_back({d, d + regions[i].size});
+        if (src == dst) {
+            const u64 r = src_base + regions[i].srcOffset;
+            reads.push_back({r, r + regions[i].size});
+        }
+    }
+    std::sort(writes.begin(), writes.end());
+    for (size_t i = 1; i < writes.size(); ++i) {
+        if (writes[i].first < writes[i - 1].second) return false; // two writes overlap
+    }
+    if (src == dst) {
+        // Any read overlapping any write (the writes are sorted and disjoint now).
+        for (const Span& r : reads) {
+            auto it = std::upper_bound(writes.begin(), writes.end(), Span{r.first, ~0ull});
+            if (it != writes.begin() && std::prev(it)->second > r.first) return false;
+            if (it != writes.end() && it->first < r.second) return false;
         }
     }
     struct Region { u64 src, dst; u32 end, width; };
