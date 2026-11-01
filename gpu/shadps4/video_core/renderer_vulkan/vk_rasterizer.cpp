@@ -2452,6 +2452,31 @@ u64 Rasterizer::Flush() {
     return current_tick;
 }
 
+void Rasterizer::NoteDecodedPacket(bool work) {
+    if (!BbToggle::Experiment(1ull << 15)) {
+        return;
+    }
+    const u64 tick = device.CurrentTick();
+    if (tick != early_tick) {
+        early_tick = tick; // submitted since: the work noted before went with it
+        early_work = false;
+    }
+    early_work |= work;
+    if (!early_work || (++early_packets & 7) != 0) {
+        return; // the GPU is asked at most every 8 packets (a system call)
+    }
+    if (tick == 0 || !device.IsComplete(tick - 1)) {
+        return; // the GPU is still busy: this work waits for the regular submission
+    }
+    Flush();
+    static std::atomic<u64> commits{0};
+    const u64 n = commits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || n % 5000 == 0) {
+        std::printf("Early commits (the GPU had run dry, experiment bit 15): %llu\n",
+                    (unsigned long long)n);
+    }
+}
+
 void Rasterizer::Finish() {
     DrainDrawPipe();
     PublishSignals();

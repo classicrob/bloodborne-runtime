@@ -271,6 +271,12 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     u64 Flush();
+    /// bbport (experiment bit 15): called by the command processor after each packet (`work`: a
+    /// draw, dispatch or DMA). When work was decoded since the last submission and the GPU has
+    /// finished everything submitted, submits it now instead of when decoding runs dry: the GPU
+    /// started each frame only after its first guest submission was decoded (Central Yharnam:
+    /// ~1.5-2 ms a frame of GPU idle at frame start).
+    void NoteDecodedPacket(bool work);
     void Finish();
     void OnSubmit();
 
@@ -462,6 +468,10 @@ private:
     friend class VideoCore::BufferCache;
 
     VideoCore::Backend::Device& device; ///< the render adapter's (ticks, waits)
+    // NoteDecodedPacket (command processor thread only).
+    u64 early_tick{};
+    bool early_work{};
+    u32 early_packets{};
     // The Vulkan backend's own parts only: the buffer cache's sparse arena and the upscaler.
     const Instance& instance;
     Scheduler& scheduler;
