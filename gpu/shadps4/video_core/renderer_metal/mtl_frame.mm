@@ -294,13 +294,17 @@ void NoteRenderEncoder(MTLRenderPassDescriptor* rp, bool reopened) {
 }
 
 /// Experiment bit 12: the first draw of a pass that loads its one colour target (no depth or
-/// stencil) is a rect list without blending that writes every channel over a viewport and
+/// stencil) is a rect list or a draw of at most six vertices, without blending that writes every channel over a viewport and
 /// scissor covering the whole target, so nothing loaded survives: the pass loads nothing
 /// (DontCare). Full-screen passes like the glare/bloom pyramid. The rect itself is assumed to
 /// cover the viewport (as the game's full-screen rects do); frame dumps prove it.
 void SkipOverwrittenLoad(Owned& o, MTLRenderPassDescriptor* rp) {
-    if (!BbToggle::Experiment(1ull << 12) || !o.graphics || !o.graphics->rect_list ||
-        !o.graphics->render || rp.depthAttachment.texture || rp.stencilAttachment.texture) {
+    // A rect list, or a direct draw of at most six vertices in one instance (a full-screen
+    // triangle or quad: the glare pyramid's passes draw these).
+    const bool small_draw = o.graphics && (o.graphics->rect_list || o.first_draw_vertices <= 6);
+    if (!BbToggle::Experiment(1ull << 12) || !small_draw || !o.graphics->render ||
+        o.graphics->tess || o.graphics->geometry || rp.depthAttachment.texture ||
+        rp.stencilAttachment.texture) {
         return;
     }
     MTLRenderPassColorAttachmentDescriptor* c = rp.colorAttachments[0];
@@ -337,7 +341,7 @@ void SkipOverwrittenLoad(Owned& o, MTLRenderPassDescriptor* rp) {
         const VkRect2D& r = o.scissors[0];
         if (r.offset.x > 0 || r.offset.y > 0 || r.offset.x + double(r.extent.width) < w ||
             r.offset.y + double(r.extent.height) < h) {
-            return;
+                return;
         }
     }
     c.loadAction = MTLLoadActionDontCare;
@@ -1972,6 +1976,7 @@ void FlushPending(Owned& o) {
 }
 
 void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 first_instance) {
+    o.first_draw_vertices = instance_count == 1 ? vertex_count : ~0u;
     if (!(o.graphics && o.graphics->tess)) {
         o.last_draw_tess = false;
         FlushPending(o);
@@ -2007,6 +2012,7 @@ void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 
 
 void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
                  s32 vertex_offset, u32 first_instance) {
+    o.first_draw_vertices = instance_count == 1 ? index_count : ~0u;
     if (!(o.graphics && o.graphics->tess)) {
         o.last_draw_tess = false;
         FlushPending(o);
@@ -2050,6 +2056,7 @@ void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
 
 void DrawIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset, u32 count, u32 stride,
                   bool indexed) {
+    o.first_draw_vertices = ~0u;
     if (!PrepareDraw(o)) {
         return;
     }

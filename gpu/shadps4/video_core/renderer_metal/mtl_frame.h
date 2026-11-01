@@ -95,6 +95,7 @@ struct Owned {
     MTLRenderPassDescriptor* pass_first; ///< as begun (its clears); opened at the first draw
     bool pass_opened{};                  ///< an encoder of this pass was created
     bool pass_clears{};                  ///< pass_first clears something
+    u32 first_draw_vertices{~0u};        ///< the draw being recorded: vertices of a direct draw
     // Scratch memory for tessellation (bump-allocated, kept until the GPU is done).
     id<MTLBuffer> scratch;
     u64 scratch_used{};
