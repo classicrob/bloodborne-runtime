@@ -629,10 +629,49 @@ bool Runtime::CanResampleDepth(VideoCore::Backend::Format format, bool stencil) 
     return depth_resampler->Supported(ToVk(format), stencil);
 }
 
+namespace {
+/// bbport (experiment bit 15): a deferred clear whose whole range the copy about to be recorded
+/// overwrites is dropped instead of recorded first (a clear pass, and its store, for nothing).
+/// `covers(level, first_layer, layers)`: the copy writes all of that subresource.
+template <typename Covers>
+bool DropOverwrittenClear(VideoCore::Image* dst, Covers&& covers) {
+    if (!dst->pending_clear || !BbToggle::Experiment(1ull << 15)) {
+        return false;
+    }
+    const auto& range = dst->pending_clear_range;
+    for (u32 level = range.base.level; level < range.base.level + range.extent.levels; ++level) {
+        if (!covers(level, range.base.layer, range.extent.layers)) {
+            return false;
+        }
+    }
+    dst->pending_clear = false;
+    static std::atomic<u64> dropped{0};
+    const u64 n = dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || n % 1000 == 0) {
+        std::printf("Deferred clears dropped (overwritten by a copy): %llu\n", (unsigned long long)n);
+    }
+    return true;
+}
+} // namespace
+
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
+    DropOverwrittenClear(dst, [&](u32 level, u32 first_layer, u32 layers) {
+        const u32 w = std::max(dst->info.size.width >> level, 1u);
+        const u32 h = std::max(dst->info.size.height >> level, 1u);
+        for (const auto& c : upload_copies) {
+            const auto& sub = c.imageSubresource;
+            if (sub.mipLevel == level && sub.baseArrayLayer <= first_layer &&
+                sub.baseArrayLayer + sub.layerCount >= first_layer + layers &&
+                c.imageOffset.x == 0 && c.imageOffset.y == 0 && c.imageOffset.z == 0 &&
+                c.imageExtent.width >= w && c.imageExtent.height >= h) {
+                return true;
+            }
+        }
+        return false;
+    });
     const TransferMark mark{*this, "image upload", *dst};
 
     bool needs_flush =
@@ -770,6 +809,19 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     }
 
     scheduler.EndRendering();
+    DropOverwrittenClear(dst, [&](u32 level, u32 first_layer, u32 layers) {
+        for (const auto& r : regions) {
+            const auto& sub = r.dstSubresource;
+            if (sub.mipLevel == level && sub.baseArrayLayer <= first_layer &&
+                sub.baseArrayLayer + sub.layerCount >= first_layer + layers &&
+                r.dstOffset.x == 0 && r.dstOffset.y == 0 && r.dstOffset.z == 0 &&
+                r.extent.width >= std::max(dst->info.size.width >> level, 1u) &&
+                r.extent.height >= std::max(dst->info.size.height >> level, 1u)) {
+                return true;
+            }
+        }
+        return false;
+    });
 
     bool needs_flush =
         Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -1423,14 +1475,13 @@ void Runtime::FlushBarriers() {
         if (state.depth_stencil_attachment.image_view) {
             images[n++] = VkImage(MetalLayer::ImageOfView(state.depth_stencil_attachment.image_view));
         }
-        // Experiment bit 9: a barrier on one of its attachments that keeps it an attachment
-        // (only attachment accesses after it: a layout change, which Metal does not have) does
-        // not count either. Sampling an attachment still ends the pass.
+        // Barriers on its attachments that keep them attachments (a layout change) are only
+        // counted: keeping the pass open for them removed no pass (measured, dropped).
         constexpr auto attachment_only =
             vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite |
             vk::AccessFlagBits2::eDepthStencilAttachmentRead |
             vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
-        const bool stays_attachment_ok = BbToggle::Experiment(1ull << 9);
+        constexpr bool stays_attachment_ok = false;
         for (const auto& barrier : image_barriers) {
             const VkImage image = static_cast<VkImage>(barrier.image);
             const bool stays_attachment =

@@ -95,6 +95,15 @@ struct Owned {
     MTLRenderPassDescriptor* pass_first; ///< as begun (its clears); opened at the first draw
     bool pass_opened{};                  ///< an encoder of this pass was created
     bool pass_clears{};                  ///< pass_first clears something
+    u32 first_draw_vertices{~0u};        ///< the draw being recorded: vertices of a direct draw
+    // Experiment bit 9 (latched per command buffer): render encoders do not declare the guest
+    // memory; fences order them against compute and blit encoders instead (FencedOrdering).
+    int fenced{-1};                          ///< -1: not decided yet
+    bool nonrender_seen{};                   ///< a compute or blit encoder was opened here
+    bool war_pending{};                      ///< a barrier since the last compute/blit wait
+    std::vector<id<MTLFence>> render_fences; ///< updated by render encoders since that wait
+    std::vector<id<MTLFence>> fence_pool;
+    size_t fence_next{};
     // Scratch memory for tessellation (bump-allocated, kept until the GPU is done).
     id<MTLBuffer> scratch;
     u64 scratch_used{};
@@ -265,7 +274,7 @@ struct Stats {
         // kept: the pass stayed open (experiment MetalBarrierInPass).
         barrier_images{}, barrier_graphics_write{}, barrier_other{}, barrier_kept{},
         clear_encoders{}, blit_image_encoders{}, barrier_images_off_pass{}, barrier_layout_only{},
-        loads_skipped{}; ///< colour loads made DontCare (experiment bit 12) ///< render encoders of image clears and blits
+        loads_skipped{}, clears_by_copy{}; ///< render encoders of image clears and blits
 };
 /// BB_METAL_PASS_STATS=1 (diagnostics, off by default).
 bool PassStats();
@@ -274,6 +283,8 @@ bool PassStats();
 bool PassDumpRecording();
 void PassDumpPresent();
 void PassDumpCommit(Owned& o);
+/// Experiment bit 9: keeps this command buffer's fences until the GPU is done with it.
+void RetainFencesUntilDone(Owned& o);
 bool CopyComputeStats();
 Stats& GetStats();
 /// The image of a view (VK_NULL_HANDLE: not known).

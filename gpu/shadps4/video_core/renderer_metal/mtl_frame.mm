@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <tuple>
@@ -248,6 +249,87 @@ void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
 }
 
 u64 AttachmentBytes(MTLRenderPassAttachmentDescriptor* a);
+
+// ---- Experiment bit 9: fenced ordering instead of guest-memory declarations on render encoders ----
+// Render encoders declared the guest memory (four pools, all of it) as read, and compute
+// encoders as read and write: Metal then serialised every render encoder against the compute
+// and blit encoders around it, dependent or not (Measurement: ~56 more gaps a frame). With
+// the bit, render encoders declare nothing (the memory stays resident through the residency
+// set) and fences keep the two real orderings:
+// - read after write: every render encoder waits for the latest compute/blit encoder (a fence
+//   each of them updates; compute and blit encoders stay ordered among themselves by tracking);
+// - write after read: a compute/blit encoder waits for the render encoders before it when the
+//   renderer recorded a barrier since its last wait (the barrier tracker found a conflict),
+//   and the first one of a command buffer waits for the previous command buffer's last render.
+bool Fenced(Owned& o) {
+    if (o.fenced < 0) {
+        // Without a residency set the declarations are also what keeps the memory resident;
+        // BB_METAL_RENDER_WRITES=1 relies on render encoders declaring their writes.
+        static const bool render_writes = [] {
+            const char* env = std::getenv("BB_METAL_RENDER_WRITES");
+            return env && env[0] == '1';
+        }();
+        o.fenced = BbToggle::Experiment(1ull << 9) && residency && !render_writes ? 1 : 0;
+    }
+    return o.fenced == 1;
+}
+id<MTLFence> NonrenderFence() {
+    static id<MTLFence> fence = [device newFence];
+    return fence;
+}
+id<MTLFence> LastRenderFence() {
+    static id<MTLFence> fence = [device newFence];
+    return fence;
+}
+/// Both global fences updated once by a submitted encoder before any recorded work, so that no
+/// wait ever refers to a fence nothing updated.
+void SeedOrderFences() {
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    cmd.label = @"bbport fence seed";
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc updateFence:NonrenderFence()];
+    [enc updateFence:LastRenderFence()];
+    [enc endEncoding];
+    [cmd commit];
+}
+// The global fences are updated and the command-buffer boundary waited in both modes, so a
+// command buffer of either mode orders against one of the other (the bit can flip between
+// command buffers recorded on different threads).
+constexpr MTLRenderStages kRenderStages = MTLRenderStageVertex | MTLRenderStageFragment;
+void FenceRenderStart(Owned& o) {
+    [o.render waitForFence:NonrenderFence() beforeStages:kRenderStages];
+}
+void FenceRenderEnd(Owned& o) {
+    [o.render updateFence:LastRenderFence() afterStages:kRenderStages];
+    if (!Fenced(o)) {
+        return;
+    }
+    if (o.fence_next == o.fence_pool.size()) {
+        o.fence_pool.push_back([device newFence]);
+    }
+    id<MTLFence> fence = o.fence_pool[o.fence_next++];
+    [o.render updateFence:fence afterStages:kRenderStages];
+    o.render_fences.push_back(fence);
+}
+template <typename Encoder>
+void FenceNonrenderStart(Owned& o, Encoder encoder) {
+    if (!o.nonrender_seen) {
+        [encoder waitForFence:LastRenderFence()];
+        o.nonrender_seen = true;
+    }
+    if (o.war_pending && Fenced(o)) {
+        for (id<MTLFence> fence : o.render_fences) {
+            [encoder waitForFence:fence];
+        }
+        o.render_fences.clear();
+        o.fence_next = 0; // every fence in the pool has been waited on: free again
+    }
+    o.war_pending = false;
+}
+template <typename Encoder>
+void FenceNonrenderEnd(Encoder encoder) {
+    [encoder updateFence:NonrenderFence()];
+}
 void DumpRender(Owned& o, MTLRenderPassDescriptor* rp, const char* kind);
 void DumpOpen(Owned& o, const char* kind);
 void DumpClose(Owned& o);
@@ -293,58 +375,6 @@ void NoteRenderEncoder(MTLRenderPassDescriptor* rp, bool reopened) {
     }
 }
 
-/// Experiment bit 12: the first draw of a pass that loads its one colour target (no depth or
-/// stencil) is a rect list without blending that writes every channel over a viewport and
-/// scissor covering the whole target, so nothing loaded survives: the pass loads nothing
-/// (DontCare). Full-screen passes like the glare/bloom pyramid. The rect itself is assumed to
-/// cover the viewport (as the game's full-screen rects do); frame dumps prove it.
-void SkipOverwrittenLoad(Owned& o, MTLRenderPassDescriptor* rp) {
-    if (!BbToggle::Experiment(1ull << 12) || !o.graphics || !o.graphics->rect_list ||
-        !o.graphics->render || rp.depthAttachment.texture || rp.stencilAttachment.texture) {
-        return;
-    }
-    MTLRenderPassColorAttachmentDescriptor* c = rp.colorAttachments[0];
-    if (!c.texture || c.loadAction != MTLLoadActionLoad) {
-        return;
-    }
-    for (u32 i = 1; i < 8; ++i) {
-        if (rp.colorAttachments[i].texture) {
-            return;
-        }
-    }
-    const auto& key = o.graphics->render->key;
-    using Mask = VideoCore::Backend::ColorWriteMask;
-    const u32 mask = u32(key.write_masks[0]);
-    const MTLPixelFormat f = c.texture.pixelFormat;
-    const u32 needed = f == MTLPixelFormatRG11B10Float || f == MTLPixelFormatRGB9E5Float
-                           ? u32(Mask::R) | u32(Mask::G) | u32(Mask::B)
-                           : u32(Mask::All);
-    if ((mask & needed) != needed || Vulkan::AttachmentBlendState(key, 0).enable) {
-        return;
-    }
-    const double w = double(std::max<NSUInteger>(1, c.texture.width >> c.level));
-    const double h = double(std::max<NSUInteger>(1, c.texture.height >> c.level));
-    if (o.viewports.empty()) {
-        return;
-    }
-    const VkViewport& v = o.viewports[0];
-    const double vx0 = std::min(v.x, v.x + v.width), vx1 = std::max(v.x, v.x + v.width);
-    const double vy0 = std::min(v.y, v.y + v.height), vy1 = std::max(v.y, v.y + v.height);
-    if (vx0 > 0 || vy0 > 0 || vx1 < w || vy1 < h) {
-        return;
-    }
-    if (!o.scissors.empty()) {
-        const VkRect2D& r = o.scissors[0];
-        if (r.offset.x > 0 || r.offset.y > 0 || r.offset.x + double(r.extent.width) < w ||
-            r.offset.y + double(r.extent.height) < h) {
-            return;
-        }
-    }
-    c.loadAction = MTLLoadActionDontCare;
-    if (PassStats()) {
-        ++stats.loads_skipped;
-    }
-}
 
 /// The render encoder of the current pass, opened on first use: a pass without draws costs
 /// nothing unless it clears (EndRendering), and work before its first draw (tessellation
@@ -355,16 +385,15 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
     }
     if (o.compute) {
         DumpClose(o);
+        FenceNonrenderEnd(o.compute);
         [o.compute endEncoding];
         o.compute = nil;
     }
     if (o.blit) {
         DumpClose(o);
+        FenceNonrenderEnd(o.blit);
         [o.blit endEncoding];
         o.blit = nil;
-    }
-    if (!o.pass_opened) {
-        SkipOverwrittenLoad(o, o.pass_first);
     }
     if (PassStats()) {
         NoteRenderEncoder(o.pass_opened ? o.pass : o.pass_first, o.pass_opened);
@@ -379,7 +408,11 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
     o.pass_opened = true;
     o.cache = {};
     if (o.render) {
-        UseAddressBuffers(o.render, true);
+        if (Fenced(o)) {
+            FenceRenderStart(o);
+        } else {
+            UseAddressBuffers(o.render, true);
+        }
     }
     return o.render;
 }
@@ -401,6 +434,7 @@ id<MTLComputeCommandEncoder> ComputeEncoder(Owned& o) {
         o.compute = [o.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
     }
     UseAddressBuffers(o.compute, false);
+    FenceNonrenderStart(o, o.compute);
     return o.compute;
 }
 
@@ -422,6 +456,7 @@ id<MTLBlitCommandEncoder> BlitEncoder(Owned& o) {
         o.blit = [o.cmd blitCommandEncoder];
     }
     o.dump_count = 1;
+    FenceNonrenderStart(o, o.blit);
     return o.blit;
 }
 
@@ -1060,6 +1095,7 @@ void Init(VkDevice dev, id<MTLCommandQueue> q, PFN_vkExportMetalObjectsEXT expor
     if (residency) {
         [residency commit];
         [queue addResidencySet:residency];
+        SeedOrderFences();
     } else {
         std::printf("Metal frame: no residency set (%s): every device-address buffer is declared "
                     "on each encoder instead\n",
@@ -1073,17 +1109,31 @@ void EndEncoders(Owned& o) {
         DumpClose(o);
     }
     if (o.render) {
+        FenceRenderEnd(o);
         [o.render endEncoding];
         o.render = nil;
     }
     if (o.compute) {
+        FenceNonrenderEnd(o.compute);
         [o.compute endEncoding];
         o.compute = nil;
     }
     if (o.blit) {
+        FenceNonrenderEnd(o.blit);
         [o.blit endEncoding];
         o.blit = nil;
     }
+}
+
+void RetainFencesUntilDone(Owned& o) {
+    if (o.fence_pool.empty()) {
+        return;
+    }
+    // The command buffer does not retain what it uses (unretained references).
+    __block std::vector<id<MTLFence>> fences = o.fence_pool;
+    [o.cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      fences.clear();
+    }];
 }
 
 void ReturnScratchWhenDone(Owned& o) {
@@ -1115,6 +1165,7 @@ void CommitChunk(Owned& o) {
         }];
     }
     MetalGpuTiming::Commit(o.timing, o.cmd);
+    RetainFencesUntilDone(o);
     [o.cmd commit];
     o.cmd = [queue commandBufferWithUnretainedReferences];
     o.cmd.label = @"bbport Metal path";
@@ -1384,8 +1435,10 @@ void DeviceAddressTaken(VkBuffer buffer) {
 void Barrier(Owned& o) {
     // Tracked resources order the encoders; inside a compute encoder dispatches are serial.
     // A blit encoder is ended so the next command sees its writes.
+    o.war_pending = true; // experiment bit 9: the next compute/blit encoder waits for renders
     if (o.blit) {
         DumpClose(o);
+        FenceNonrenderEnd(o.blit);
         [o.blit endEncoding];
         o.blit = nil;
     }
@@ -1531,6 +1584,7 @@ void EndRendering(Owned& o) {
     }
     if (o.render) {
         DumpClose(o);
+        FenceRenderEnd(o);
         [o.render endEncoding];
         o.render = nil;
     }
@@ -1972,6 +2026,7 @@ void FlushPending(Owned& o) {
 }
 
 void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 first_instance) {
+    o.first_draw_vertices = instance_count == 1 ? vertex_count : ~0u;
     if (!(o.graphics && o.graphics->tess)) {
         o.last_draw_tess = false;
         FlushPending(o);
@@ -2007,6 +2062,7 @@ void Draw(Owned& o, u32 vertex_count, u32 instance_count, u32 first_vertex, u32 
 
 void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
                  s32 vertex_offset, u32 first_instance) {
+    o.first_draw_vertices = instance_count == 1 ? index_count : ~0u;
     if (!(o.graphics && o.graphics->tess)) {
         o.last_draw_tess = false;
         FlushPending(o);
@@ -2050,6 +2106,7 @@ void DrawIndexed(Owned& o, u32 index_count, u32 instance_count, u32 first_index,
 
 void DrawIndirect(Owned& o, VkBuffer buffer, VkDeviceSize offset, u32 count, u32 stride,
                   bool indexed) {
+    o.first_draw_vertices = ~0u;
     if (!PrepareDraw(o)) {
         return;
     }
@@ -2128,12 +2185,18 @@ bool CopyComputeStats() {
 static bool BufferAsCompute(Owned& o, id<MTLBuffer> src, u64 src_base,
                             id<MTLBuffer> dst, u64 dst_base, u32 count,
                             const VkBufferCopy* regions, u8 fill) {
-    if (!BbToggle::Experiment(1ull << 10) || !o.compute || o.render ||
+    // Experiment bit 14 (reused; larger transfers were dropped): with no encoder open, a small
+    // transfer opens a compute encoder instead of a blit one, so the next transfers after a
+    // barrier (which ends blit encoders, not compute ones) join it: no blit -> blit gaps.
+    const bool open_compute = !o.compute && !o.blit && !o.render &&
+                              BbToggle::Experiment(1ull << 14);
+    if (!BbToggle::Experiment(1ull << 10) || (!o.compute && !open_compute) || o.render ||
         !o.pending.empty() || !count) return false;
-    static const u64 limit = []() -> u64 {
+    static const u64 env_limit = []() -> u64 {
         const char* e = std::getenv("BB_COPY_COMPUTE_MAX");
         return e ? std::min<u64>(std::strtoull(e, nullptr, 0), 1ull << 30) : 65536;
     }();
+    const u64 limit = env_limit;
     u64 total = 0;
     for (u32 i = 0; i < count; ++i) {
         if (regions[i].size > limit - total) return false;
@@ -2202,6 +2265,9 @@ kernel void buffer_vectors(device const uchar* src [[buffer(0)]],
         if (!pipeline) std::printf("Metal buffer kernel: %s\n", error.localizedDescription.UTF8String);
     });
     if (!pipeline) return false;
+    if (!o.compute) {
+        ComputeEncoder(o);
+    }
     if (src) [o.compute useResource:src usage:MTLResourceUsageRead];
     [o.compute useResource:dst usage:src == dst ? MTLResourceUsageRead | MTLResourceUsageWrite
                                                : MTLResourceUsageWrite];
@@ -2349,10 +2415,67 @@ void ForEachSubresource(id<MTLTexture> texture, u32 count, const VkImageSubresou
 }
 } // namespace
 
+namespace {
+/// Experiment bit 12 (reused; the DontCare-load experiment was dropped): RGBA8/BGRA8 colour
+/// clears as blit copies from a buffer holding the clear value, not as empty render passes. In
+/// Iosefka's Clinic one 960x540 RGBA8 clear pass a frame lasts 2.2-2.9 ms on the GPU for
+/// 0.016 ms of stage work (Measurement); this tests whether the render-pass clear is the slow
+/// part.
+bool ClearByCopy(Owned& o, id<MTLTexture> texture, const VkClearColorValue* color, u32 count,
+                 const VkImageSubresourceRange* ranges) {
+    const MTLPixelFormat f = texture.pixelFormat;
+    if ((f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatBGRA8Unorm) ||
+        texture.textureType != MTLTextureType2D || texture.sampleCount != 1) {
+        return false;
+    }
+    const auto unorm = [](float v) { return u8(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f)); };
+    const float* c = color->float32;
+    const u8 r = unorm(c[0]), g = unorm(c[1]), b = unorm(c[2]), a = unorm(c[3]);
+    const u32 pixel = f == MTLPixelFormatRGBA8Unorm ? u32(r) | u32(g) << 8 | u32(b) << 16 | u32(a) << 24
+                                                    : u32(b) | u32(g) << 8 | u32(r) << 16 | u32(a) << 24;
+    const NSUInteger w = texture.width, h = texture.height;
+    const NSUInteger bytes = w * h * 4;
+    // One buffer per (size, value), kept: the game clears the same targets to the same values.
+    static std::mutex mutex;
+    static std::map<std::pair<NSUInteger, u32>, id<MTLBuffer>> patterns;
+    id<MTLBuffer> pattern;
+    {
+        std::scoped_lock lock{mutex};
+        auto& slot = patterns[{bytes, pixel}];
+        if (!slot) {
+            slot = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+            std::fill_n(static_cast<u32*>(slot.contents), w * h, pixel);
+        }
+        pattern = slot;
+    }
+    id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
+    DumpWrite(o, texture);
+    ForEachSubresource(texture, count, ranges, [&](u32, u32 level, u32 layer) {
+        const NSUInteger lw = std::max<NSUInteger>(1, w >> level), lh = std::max<NSUInteger>(1, h >> level);
+        [blit copyFromBuffer:pattern
+                   sourceOffset:0
+              sourceBytesPerRow:lw * 4
+            sourceBytesPerImage:lw * lh * 4
+                     sourceSize:MTLSizeMake(lw, lh, 1)
+                      toTexture:texture
+               destinationSlice:layer
+               destinationLevel:level
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+    });
+    if (PassStats()) {
+        ++stats.clears_by_copy;
+    }
+    return true;
+}
+} // namespace
+
 void ClearColorImage(Owned& o, VkImage image, const VkClearColorValue* color, u32 count,
                      const VkImageSubresourceRange* ranges) {
     id<MTLTexture> texture = TextureOfImage(image);
     if (!texture) {
+        return;
+    }
+    if (BbToggle::Experiment(1ull << 12) && ClearByCopy(o, texture, color, count, ranges)) {
         return;
     }
     EndEncoders(o);
