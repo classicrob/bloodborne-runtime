@@ -873,6 +873,309 @@ static std::pair<u32, u32> GetDrawOffsets(
     return {vertex_offset, instance_offset};
 }
 
+// bbport BB_SHADOW_TRACE=<file> (diagnostics): when the file exists, the next whole frame's
+// commands are printed in order and the file is removed: every dispatch, and every draw into a
+// small 16:16 color target (the moment shadow maps), with the addresses each reads and writes;
+// other draws as runs per target. Shows which shadow renders and compute passes depend on each
+// other.
+namespace {
+struct ShadowTrace {
+    std::mutex mutex;
+    u32 frame{~0u};
+    bool active{};
+    u64 seq{}, other_target{}, other_draws{};
+};
+ShadowTrace shadow_trace;
+
+void ShadowTraceResources(std::string& line, const Shader::Info& info) {
+    for (const auto& desc : info.buffers) {
+        if (desc.buffer_type != Shader::BufferType::Guest) continue;
+        const auto buffer = desc.GetSharp(info);
+        line += fmt::format(" {}buf {:x}+{:x}", desc.is_written ? "W" : "R",
+                            u64(buffer.base_address), buffer.GetSize());
+        // Small read-only buffers (the surface operations' parameters): their first dwords.
+        if (!desc.is_written && buffer.GetSize() <= 0x40 && buffer.base_address) {
+            const auto* words = reinterpret_cast<const u32*>(u64(buffer.base_address));
+            line += " [";
+            for (u32 i = 0; i < std::min<u32>(buffer.GetSize() / 4, 8); ++i) {
+                line += fmt::format("{}{:08x}", i ? " " : "", words[i]);
+            }
+            line += "]";
+        }
+    }
+    for (const auto& desc : info.images) {
+        const auto image = desc.GetSharp(info);
+        line += fmt::format(" {}img {:x} {}x{} layers {}-{}", desc.is_written ? "W" : "R",
+                            image.Address(), image.width + 1, image.height + 1,
+                            u32(image.base_array), u32(image.last_array));
+    }
+}
+} // namespace
+
+bool Rasterizer::ShadowTraceFrame() {
+    static const char* path = std::getenv("BB_SHADOW_TRACE");
+    if (!path) return false;
+    const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (frame != shadow_trace.frame) {
+        shadow_trace.frame = frame;
+        if (shadow_trace.active) {
+            if (shadow_trace.other_draws) {
+                std::printf("Shadow trace: %llu   other draws x%llu into %llx\n",
+                            (unsigned long long)shadow_trace.seq++,
+                            (unsigned long long)shadow_trace.other_draws,
+                            (unsigned long long)shadow_trace.other_target);
+            }
+            std::printf("Shadow trace: end of frame\n");
+            shadow_trace.active = false;
+        } else if (std::filesystem::exists(path)) {
+            std::filesystem::remove(path);
+            shadow_trace.seq = shadow_trace.other_target = shadow_trace.other_draws = 0;
+            shadow_trace.active = true;
+            std::printf("Shadow trace: frame %u\n", frame);
+        }
+    }
+    return shadow_trace.active;
+}
+
+void Rasterizer::ShadowTraceDraw(const GraphicsPipeline* pipeline) {
+    std::scoped_lock lock{shadow_trace.mutex};
+    if (!ShadowTraceFrame()) return;
+    const auto& regs = Regs();
+    const auto& cb = regs.color_buffers[0];
+    const u64 target = cb ? cb.Address() : 0;
+    const bool shadow = pipeline->GetGraphicsKey().num_color_attachments == 1 && cb &&
+                        cb.GetDataFmt() == AmdGpu::DataFormat::Format16_16 && cb.Pitch() <= 256;
+    if (!shadow) {
+        if (target != shadow_trace.other_target && shadow_trace.other_draws) {
+            std::printf("Shadow trace: %llu   other draws x%llu into %llx\n",
+                        (unsigned long long)shadow_trace.seq++,
+                        (unsigned long long)shadow_trace.other_draws,
+                        (unsigned long long)shadow_trace.other_target);
+            shadow_trace.other_draws = 0;
+        }
+        shadow_trace.other_target = target;
+        ++shadow_trace.other_draws;
+        return;
+    }
+    if (shadow_trace.other_draws) {
+        std::printf("Shadow trace: %llu   other draws x%llu into %llx\n",
+                    (unsigned long long)shadow_trace.seq++,
+                    (unsigned long long)shadow_trace.other_draws,
+                    (unsigned long long)shadow_trace.other_target);
+        shadow_trace.other_draws = 0;
+    }
+    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+    std::string line = fmt::format("D target {:x} {}x{} slices {}-{} depth {:x} vs {:x} ps {:x} "
+                                   "indices {}",
+                                   target, cb.Pitch(), cb.Height(), u32(cb.view.slice_start),
+                                   u32(cb.view.slice_max),
+                                   regs.depth_buffer.DepthAddress(), vs ? vs->pgm_hash : 0,
+                                   ps ? ps->pgm_hash : 0, regs.num_indices);
+    if (ps) ShadowTraceResources(line, *ps);
+    std::printf("Shadow trace: %llu %s\n", (unsigned long long)shadow_trace.seq++, line.c_str());
+}
+
+void Rasterizer::ShadowTraceDispatch(const ComputePipeline* pipeline) {
+    std::scoped_lock lock{shadow_trace.mutex};
+    if (!ShadowTraceFrame()) return;
+    if (shadow_trace.other_draws) {
+        std::printf("Shadow trace: %llu   other draws x%llu into %llx\n",
+                    (unsigned long long)shadow_trace.seq++,
+                    (unsigned long long)shadow_trace.other_draws,
+                    (unsigned long long)shadow_trace.other_target);
+        shadow_trace.other_draws = 0;
+    }
+    const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    const auto& p = CsRegs();
+    std::string line =
+        fmt::format("C cs {:x} groups {}x{}x{}", cs.pgm_hash, p.dim_x, p.dim_y, p.dim_z);
+    ShadowTraceResources(line, cs);
+    std::printf("Shadow trace: %llu %s\n", (unsigned long long)shadow_trace.seq++, line.c_str());
+}
+
+void Rasterizer::ShadowReuseProbe(const GraphicsPipeline* pipeline, bool is_indexed,
+                                  u32 index_offset) {
+    const auto& regs = Regs();
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto& cb = regs.color_buffers[0];
+    if (key.num_color_attachments != 1 || !cb ||
+        cb.GetDataFmt() != AmdGpu::DataFormat::Format16_16 || cb.Pitch() > 256 ||
+        !regs.depth_buffer.DepthAddress()) {
+        return;
+    }
+    struct Pass {
+        u64 target{}, signature{};
+        u32 draws{};
+        bool unknown{};
+        bool dynamic{}; ///< GPU-written vertex data or constants (not only images)
+    };
+    struct State {
+        std::mutex mutex;
+        u32 frame{~0u};
+        std::vector<Pass> current, previous;
+        u64 frames{}, passes{}, draws{}, same_passes{}, same_draws{}, unknown_passes{},
+            unknown_draws{};
+        // Why draws were unknown: images, GPU-written (index, vertex, constants), unmapped, large.
+        std::array<u64, 7> reasons{};
+        u64 dynamic_passes{}, dynamic_draws{};
+    };
+    static State state;
+    std::scoped_lock lock{state.mutex};
+    const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (frame != state.frame) {
+        // A new frame: compare the last one's passes with the frame before (n-th pass on the same
+        // target).
+        if (state.frame != ~0u) {
+            ++state.frames;
+            std::unordered_map<u64, u32> seen_prev, seen_cur;
+            std::unordered_map<u64, std::vector<const Pass*>> prev_by_target;
+            for (const auto& p : state.previous) {
+                prev_by_target[p.target].push_back(&p);
+            }
+            for (const auto& p : state.current) {
+                const u32 n = seen_cur[p.target]++;
+                ++state.passes;
+                if (p.dynamic) {
+                    ++state.dynamic_passes;
+                    state.dynamic_draws += p.draws;
+                }
+                state.draws += p.draws;
+                const auto it = prev_by_target.find(p.target);
+                const Pass* before =
+                    it != prev_by_target.end() && n < it->second.size() ? it->second[n] : nullptr;
+                if (p.unknown || (before && before->unknown)) {
+                    ++state.unknown_passes;
+                    state.unknown_draws += p.draws;
+                } else if (before && before->signature == p.signature) {
+                    ++state.same_passes;
+                    state.same_draws += p.draws;
+                }
+            }
+            if (state.frames % 300 == 0) {
+                std::printf("Shadow reuse probe: %llu frames, %.1f passes and %.1f draws a frame; "
+                            "unchanged from the previous frame: %.1f passes, %.1f draws; unknown "
+                            "(GPU-written input or images): %.1f passes, %.1f draws\n",
+                            (unsigned long long)state.frames,
+                            double(state.passes) / state.frames, double(state.draws) / state.frames,
+                            double(state.same_passes) / state.frames,
+                            double(state.same_draws) / state.frames,
+                            double(state.unknown_passes) / state.frames,
+                            double(state.unknown_draws) / state.frames);
+                std::printf("Shadow reuse probe: unknown because (draws a frame): images %.1f, "
+                            "GPU-written index %.1f, vertex %.1f, constants %.1f, unmapped %.1f, "
+                            "buffer over 1 MiB %.1f\n",
+                            double(state.reasons[0]) / state.frames,
+                            double(state.reasons[1]) / state.frames,
+                            double(state.reasons[2]) / state.frames,
+                            double(state.reasons[3]) / state.frames,
+                            double(state.reasons[4]) / state.frames,
+                            double(state.reasons[5]) / state.frames);
+                std::printf("Shadow reuse probe: passes with GPU-written vertex data or constants "
+                            "(never reusable): %.1f passes, %.1f draws a frame\n",
+                            double(state.dynamic_passes) / state.frames,
+                            double(state.dynamic_draws) / state.frames);
+            }
+        }
+        state.previous.swap(state.current);
+        state.current.clear();
+        state.frame = frame;
+    }
+    const u64 target = cb.Address();
+    if (state.current.empty() || state.current.back().target != target) {
+        state.current.push_back({.target = target, .signature = target});
+    }
+    auto& pass = state.current.back();
+    ++pass.draws;
+    u64 h = pass.signature;
+    const auto mix = [&h](const void* data, u64 bytes) { h = XXH3_64bits_withSeed(data, bytes, h); };
+    // Guest memory read in place, unless unmapped or written by the GPU (then unknown).
+    std::array<bool, 7> why{};
+    const auto mix_memory = [&](VAddr address, u64 bytes, u32 kind) {
+        mix(&address, sizeof(address));
+        mix(&bytes, sizeof(bytes));
+        if (bytes == 0) return;
+        if (!memory->IsValidGpuMapping(address, 0) ||
+            memory->ClampRangeSize(address, bytes) != bytes) {
+            pass.unknown = why[4] = true;
+            return;
+        }
+        if (buffer_cache.IsRegionGpuModified(address, bytes)) {
+            pass.unknown = why[kind] = true;
+            return;
+        }
+        mix(reinterpret_cast<const void*>(address), bytes);
+    };
+    mix(&key, sizeof(key));
+    mix(&regs.viewports[0], sizeof(regs.viewports[0]));
+    mix(&regs.viewport_scissors[0], sizeof(regs.viewport_scissors[0]));
+    mix(&regs.screen_scissor, sizeof(regs.screen_scissor));
+    const u64 depth = regs.depth_buffer.DepthAddress();
+    mix(&depth, sizeof(depth));
+    const u32 counts[3] = {regs.num_indices, regs.num_instances.NumInstances(), index_offset};
+    mix(counts, sizeof(counts));
+    const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+    const auto& fetch = pipeline->GetFetchShader();
+    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs, fetch);
+    const u32 offsets[2] = {vertex_offset, instance_offset};
+    mix(offsets, sizeof(offsets));
+    // The highest vertex the draw reads: its vertex buffers are hashed up to there.
+    u64 max_vertex = regs.num_indices ? regs.num_indices - 1 : 0;
+    if (is_indexed) {
+        const bool index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+        const u32 width = index16 ? 2 : 4;
+        const VAddr address = regs.index_base_address.Address<VAddr>() + u64(index_offset) * width;
+        const u64 bytes = u64(regs.num_indices) * width;
+        const bool was_unknown = pass.unknown;
+        pass.unknown = false;
+        mix_memory(address, bytes, 1);
+        if (!pass.unknown) {
+            max_vertex = 0;
+            for (u64 i = 0; i < regs.num_indices; ++i) {
+                const u64 index = index16 ? reinterpret_cast<const u16*>(address)[i]
+                                          : reinterpret_cast<const u32*>(address)[i];
+                max_vertex = std::max(max_vertex, index);
+            }
+        }
+        pass.unknown |= was_unknown;
+    }
+    max_vertex += vertex_offset;
+    const u64 instances = regs.num_instances.NumInstances() + u64(instance_offset);
+    if (fetch) {
+        for (const auto& attr : fetch->attributes) {
+            const auto buffer = attr.GetSharp(vs);
+            mix(&buffer, sizeof(buffer));
+            const u64 stride = buffer.GetStride();
+            // Per-instance attributes: every instance's record (step rates are in the key).
+            const u64 records = attr.GetStepRate() == Shader::Gcn::VertexAttribute::None
+                                    ? max_vertex + 1
+                                    : instances;
+            const u64 bytes = stride ? std::min<u64>(buffer.GetSize(), records * stride)
+                                     : buffer.GetSize();
+            mix_memory(buffer.base_address, bytes, 2);
+        }
+    }
+    for (const auto* info : pipeline->GetStages()) {
+        if (!info) continue;
+        if (!info->images.empty()) pass.unknown = why[0] = true;
+        for (const auto& desc : info->buffers) {
+            if (desc.buffer_type != Shader::BufferType::Guest) continue;
+            const auto buffer = desc.GetSharp(*info);
+            mix(&buffer, sizeof(buffer));
+            if (buffer.GetSize() > (1u << 20)) {
+                pass.unknown = why[5] = true; // not a plain constant buffer: not hashed
+                continue;
+            }
+            mix_memory(buffer.base_address, buffer.GetSize(), 3);
+        }
+    }
+    pass.signature = h;
+    for (u32 i = 0; i < why.size(); ++i) {
+        state.reasons[i] += why[i];
+    }
+    pass.dynamic |= why[2] || why[3];
+}
+
 void Rasterizer::EliminateFastClear() {
     auto& col_buf = Regs().color_buffers[0];
     if (!col_buf || !col_buf.info.fast_clear) {
@@ -1842,6 +2145,44 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }
         }
     }
+    // bbport BB_SHADOW_REUSE_PROBE=1 (measurement only, nothing is skipped): could a small shadow
+    // map pass (one 16:16 color target of at most 256 pixels, with depth) reuse last frame's
+    // result? Each pass (consecutive draws into one target, keyed by the target and its n-th pass
+    // in the frame) gets a signature of everything its draws read: pipeline, draw registers,
+    // index, vertex and constant buffer contents. Memory the GPU wrote, or a shader reading an
+    // image, makes the pass unknown. Every 300 frames: passes and draws whose signature equals
+    // the previous frame's.
+    static const bool reuse_probe = std::getenv("BB_SHADOW_REUSE_PROBE") != nullptr;
+    if (reuse_probe) {
+        ShadowReuseProbe(pipeline, is_indexed, index_offset);
+    }
+    static const bool shadow_trace_on = std::getenv("BB_SHADOW_TRACE") != nullptr;
+    if (shadow_trace_on) {
+        ShadowTraceDraw(pipeline);
+    }
+    // bbport BB_KNOCKOUT=<program hash>[,...] (measurement only): while experiment bit 19 is set,
+    // draws whose vertex or pixel program is listed are not drawn, so per-encoder GPU timing
+    // shows what those programs' draws cost. Changes the picture while on; never a default.
+    static const std::vector<u64> knockout = [] {
+        std::vector<u64> list;
+        if (const char* env = std::getenv("BB_KNOCKOUT")) {
+            for (const char* p = env; *p;) {
+                char* end{};
+                const u64 hash = std::strtoull(p, &end, 16);
+                if (end == p) break;
+                list.push_back(hash);
+                p = *end == ',' ? end + 1 : end;
+            }
+        }
+        return list;
+    }();
+    if (!knockout.empty() && BbToggle::Experiment(1ull << 19)) {
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage && std::ranges::find(knockout, stage->pgm_hash) != knockout.end()) {
+                return;
+            }
+        }
+    }
     static const bool fixed_probe = std::getenv("BB_FIXED_QUAD_PROBE") != nullptr;
     if (fixed_probe) {
         static std::atomic<u64> ls_hs_draws{0};
@@ -2328,6 +2669,10 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     const auto& cs_program = CsRegs();
 
+    static const bool shadow_trace_on = std::getenv("BB_SHADOW_TRACE") != nullptr;
+    if (shadow_trace_on) {
+        ShadowTraceDispatch(pipeline);
+    }
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     // After the resource binding: its transfers (image uploads, downloads) mark themselves.
     const auto mark = [&] {
@@ -2345,6 +2690,18 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     {
         BB_SECTION(ShaderHle);
         hle = ExecuteShaderHLE(cs, Regs(), cs_program, *this);
+    }
+    {
+        static const u64 hle_debug = [] {
+            const char* env = std::getenv("BB_CLEAR_HLE_DEBUG");
+            return env ? std::strtoull(env, nullptr, 16) : 0ull;
+        }();
+        if (hle_debug && cs.pgm_hash == hle_debug) {
+            static std::array<std::atomic<u64>, 2> seen{};
+            if (seen[hle].fetch_add(1) == 0) {
+                std::printf("Clear HLE debug: DispatchRecord, ExecuteShaderHLE %d\n", int(hle));
+            }
+        }
     }
     if (hle) {
         return;
@@ -2745,6 +3102,18 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                           : !(hle_off & 2) && IsComputeMetaClear(pipeline) ? 2
                           : !(hle_off & 4) && IsComputeImageClear(pipeline) ? 3
                                                                              : 0;
+        // bbport BB_CLEAR_HLE_DEBUG=<program hash>: which substitution that program got.
+        static const u64 which_debug = [] {
+            const char* env = std::getenv("BB_CLEAR_HLE_DEBUG");
+            return env ? std::strtoull(env, nullptr, 16) : 0ull;
+        }();
+        if (which_debug && pipeline->IsCompute() &&
+            pipeline->GetStage(Shader::SwStage::Compute).pgm_hash == which_debug) {
+            static std::array<std::atomic<u64>, 4> seen{};
+            if (seen[which].fetch_add(1) == 0) {
+                std::printf("Clear HLE debug: BindResources substitution %d\n", which);
+            }
+        }
         if (hle_stats) {
             static std::array<u64, 4> counts{};
             static auto last = std::chrono::steady_clock::now();
@@ -3631,6 +4000,28 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     // Ensure shader only has 2 bound buffers
     const auto& cs_pgm = CsRegs();
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
+    {
+        // bbport BB_CLEAR_HLE_DEBUG=<program hash> (diagnostics): the first checks' inputs.
+        static const u64 first_debug = [] {
+            const char* env = std::getenv("BB_CLEAR_HLE_DEBUG");
+            return env ? std::strtoull(env, nullptr, 16) : 0ull;
+        }();
+        if (first_debug && info.pgm_hash == first_debug) {
+            std::string line = fmt::format("checks: threads {} buffers {} images {}",
+                                           cs_pgm.num_thread_x.full, ShaderBufferCount(info),
+                                           info.images.size());
+            for (const auto& d : info.buffers) {
+                line += fmt::format(" [type {} written {} formatted {}]", u32(d.buffer_type),
+                                    d.is_written, d.is_formatted);
+            }
+            static std::mutex mutex;
+            static std::unordered_set<std::string> printed;
+            std::scoped_lock lock{mutex};
+            if (printed.insert(line).second) {
+                std::printf("Clear HLE debug: %s\n", line.c_str());
+            }
+        }
+    }
     if (cs_pgm.num_thread_x.full != 64 || ShaderBufferCount(info) != 2 || !info.images.empty()) {
         return false;
     }
@@ -3646,8 +4037,80 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     const AmdGpu::Buffer buf0 = desc0.GetSharp(info);
     const AmdGpu::Buffer buf1 = desc1.GetSharp(info);
     const u32 buf1_bpp = AmdGpu::NumBitsPerBlock(buf1.GetDataFmt());
+    // bbport BB_CLEAR_HLE_DEBUG=<program hash> (diagnostics): the buffers and the cached images
+    // over the written range, once per distinct line.
+    static const u64 debug_hash = [] {
+        const char* env = std::getenv("BB_CLEAR_HLE_DEBUG");
+        return env ? std::strtoull(env, nullptr, 16) : 0ull;
+    }();
+    if (debug_hash && info.pgm_hash == debug_hash) {
+        std::string line = fmt::format("params {:#x} bytes, target {:#x}+{:#x} bits {} dim_x {}",
+                                       buf0.GetSize(), u64(buf1.base_address), buf1.GetSize(),
+                                       buf1_bpp, cs_pgm.dim_x);
+        texture_cache.ForEachImageInRegion(
+            buf1.base_address, buf1.GetSize(), [&](VideoCore::ImageId, VideoCore::Image& image) {
+                const auto& i = image.info;
+                line += fmt::format(" | image {:#x}+{:#x} {}x{} layers {} levels {} layer0 {:#x} "
+                                    "bits {} depth {}",
+                                    i.guest_address, i.guest_size, i.size.width, i.size.height,
+                                    i.resources.layers, i.resources.levels, i.mips_layout[0].size,
+                                    i.num_bits, i.props.is_depth);
+            });
+        static std::mutex mutex;
+        static std::unordered_set<std::string> printed;
+        std::scoped_lock lock{mutex};
+        // Addresses differ per layer: keep the line's shape, not every layer.
+        if (printed.size() < 40 && printed.insert(line).second) {
+            std::printf("Clear HLE debug: %s\n", line.c_str());
+        }
+    }
     if (buf0.GetSize() != 16 || (cs_pgm.dim_x * 128ULL * (buf1_bpp / 8)) != buf1.GetSize()) {
         return false;
+    }
+
+    // bbport (experiment bit 18): the buffer may be one layer of an array image (the engine
+    // fills each layer of its moment shadow maps this way before drawing into it). Cleared as
+    // that layer alone when the layer's memory is exactly the buffer: an array of single-mip
+    // layers, the buffer at layer L's start and one layer long.
+    if (BbToggle::Experiment(1ull << 18)) {
+        VideoCore::ImageId layer_image{};
+        u32 layer = 0;
+        const VAddr base = buf1.base_address;
+        const u32 size = buf1.GetSize();
+        texture_cache.ForEachImageInRegion(base, size, [&](VideoCore::ImageId id,
+                                                           VideoCore::Image& image) {
+            const auto& info = image.info;
+            if (info.resources.levels != 1 || info.resources.layers < 2 ||
+                info.props.is_depth || info.num_bits != buf1_bpp ||
+                // (mips_layout[0].size is the whole array's level 0 here, not one layer)
+                u64(info.guest_size) != u64(size) * info.resources.layers ||
+                base < info.guest_address || (base - info.guest_address) % size != 0) {
+                return;
+            }
+            const u32 l = u32((base - info.guest_address) / size);
+            if (l < info.resources.layers && !layer_image) {
+                layer_image = id;
+                layer = l;
+            }
+        });
+        if (layer_image) {
+            VideoCore::Image& image = texture_cache.GetImage(layer_image);
+            const float* values = reinterpret_cast<float*>(buf0.base_address);
+            const Backend::ClearColor clear{
+                std::bit_cast<u32>(values[0]), std::bit_cast<u32>(values[1]),
+                std::bit_cast<u32>(values[2]), std::bit_cast<u32>(values[3])};
+            const VideoCore::SubresourceRange range = {
+                .base = {.level = 0, .layer = layer},
+                .extent = {.levels = 1, .layers = 1},
+            };
+            runtime.ClearImage(&image, range, clear);
+            static std::atomic<u64> layer_clears{0};
+            if (const u64 n = ++layer_clears; n == 1 || n % 4096 == 0) {
+                std::printf("Layer clears: %llu (array layer fills cleared as images)\n",
+                            (unsigned long long)n);
+            }
+            return true;
+        }
     }
 
     // Find image the buffer alias
