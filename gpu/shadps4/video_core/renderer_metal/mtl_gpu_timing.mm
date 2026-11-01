@@ -48,7 +48,8 @@ bool enabled = false;
 bool split = false;    ///< BB_METAL_GPU_TIMING=2: vertex and fragment stage ends sampled too
 unsigned every = 1;    ///< BB_METAL_GPU_TIMING_EVERY: one frame in this many sampled
 unsigned seq_from = 0, seq_to = 0; ///< BB_METAL_GPU_TIMING_SEQ=from-to: these positions in order
-std::string seq_anchor; ///< BB_METAL_GPU_TIMING_SEQ=<text>:<count>: from the first encoder named so
+std::string seq_anchor; ///< BB_METAL_GPU_TIMING_SEQ=<text>:<count>[:<before>]: around the first encoder named so
+long seq_before = 0;
 id<MTLDevice> device;
 id<MTLCounterSet> timestamps;
 std::mutex pool_mutex;
@@ -224,12 +225,15 @@ void Init(id<MTLDevice> dev) {
     split = env[0] == '2';
     if (const char* q = std::getenv("BB_METAL_GPU_TIMING_SEQ")) {
         const std::string v{q};
-        if (const auto colon = v.rfind(':'); colon != std::string::npos) {
+        if (const auto colon = v.find(':'); colon != std::string::npos) {
             // Positions vary from frame to frame: count from the first encoder whose label holds
-            // the text (a pass signature or shader name).
+            // the text (a pass signature or shader name), starting <before> encoders ahead of it.
             seq_anchor = v.substr(0, colon);
+            int count = 1, before = 0;
+            std::sscanf(v.c_str() + colon + 1, "%d:%d", &count, &before);
+            seq_before = std::max(0, before);
             seq_from = 0;
-            seq_to = unsigned(std::max(1, std::atoi(v.c_str() + colon + 1))) - 1;
+            seq_to = unsigned(std::max(1, count + before)) - 1;
         } else {
             std::sscanf(q, "%u-%u", &seq_from, &seq_to);
         }
@@ -564,6 +568,7 @@ void Report() {
         }
         const auto label_of = [](const Encoder& x) {
             return (x.kind == 'R' ? "R " + x.signature : x.kind == 'C' ? "C " + x.shader : std::string("blit")) +
+                   (x.kind == 'R' && std::string(x.origin) != "pass" ? std::string(" (") + x.origin + ")" : std::string()) +
                    (x.kind == 'R' && !x.shader.empty() ? " vs " + x.shader : std::string());
         };
         long anchor = 0;
@@ -601,7 +606,7 @@ void Report() {
                 t.encoders += 1;
                 t.work += e.work;
             }
-            const long rel = anchor < 0 ? -1 : long(position) - anchor;
+            const long rel = anchor < 0 ? -1 : long(position) - anchor + seq_before;
             if ((seq_to || !seq_anchor.empty()) && rel >= long(seq_from) && rel <= long(seq_to)) {
                 Step& st = sequence[unsigned(rel)];
                 st.exclusive += exclusive[r];
