@@ -859,7 +859,7 @@ void BufferImageCopy(Owned& o, BufferRef buffer, id<MTLTexture> texture,
     const MTLSize size = MTLSizeMake(r.imageExtent.width, r.imageExtent.height, r.imageExtent.depth);
     const MTLOrigin origin = MTLOriginMake(r.imageOffset.x, r.imageOffset.y, r.imageOffset.z);
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
-    if (PassDumpRecording()) o.dump.back() += to_image ? " op=UploadImage" : " op=DownloadImage";
+    if (PassDumpRecording() && !o.dump.empty()) o.dump.back() += to_image ? " op=UploadImage" : " op=DownloadImage";
     if (to_image) {
         DumpWrite(o, texture);
     } else {
@@ -2362,7 +2362,7 @@ void CopyBuffer(Owned& o, VkBuffer src, VkBuffer dst, u32 count, const VkBufferC
     }
     if (BufferAsCompute(o, s.buffer, s.offset, d.buffer, d.offset, count, regions, 0)) return;
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
-    if (PassDumpRecording()) o.dump.back() += " op=CopyBuffer";
+    if (PassDumpRecording() && !o.dump.empty()) o.dump.back() += " op=CopyBuffer";
     for (u32 i = 0; i < count; ++i) {
         [blit copyFromBuffer:s.buffer
                  sourceOffset:s.offset + regions[i].srcOffset
@@ -2385,7 +2385,7 @@ void FillBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, 
     const VkBufferCopy region{0, 0, length};
     if (BufferAsCompute(o, nil, 0, d.buffer, d.offset + offset, 1, &region, b)) return;
     auto blit = BlitEncoder(o);
-    if (PassDumpRecording()) o.dump.back() += " op=FillBuffer";
+    if (PassDumpRecording() && !o.dump.empty()) o.dump.back() += " op=FillBuffer";
     [blit fillBuffer:d.buffer range:NSMakeRange(d.offset + offset, length) value:b];
 }
 
@@ -2402,7 +2402,7 @@ void UpdateBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size
     const VkBufferCopy region{0, 0, size};
     if (BufferAsCompute(o, staging, 0, d.buffer, d.offset + offset, 1, &region, 0)) return;
     auto blit = BlitEncoder(o);
-    if (PassDumpRecording()) o.dump.back() += " op=UpdateBuffer";
+    if (PassDumpRecording() && !o.dump.empty()) o.dump.back() += " op=UpdateBuffer";
     [blit copyFromBuffer:staging
                       sourceOffset:0
                           toBuffer:d.buffer
@@ -2416,7 +2416,7 @@ void CopyImage(Owned& o, VkImage src, VkImage dst, u32 count, const VkImageCopy*
         return;
     }
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
-    if (PassDumpRecording()) o.dump.back() += " op=CopyImage";
+    if (PassDumpRecording() && !o.dump.empty()) o.dump.back() += " op=CopyImage";
     DumpRead(o, s);
     DumpWrite(o, d);
     for (u32 i = 0; i < count; ++i) {
@@ -2514,7 +2514,7 @@ bool ClearByCopy(Owned& o, id<MTLTexture> texture, const VkClearColorValue* colo
         pattern = slot;
     }
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
-    if (PassDumpRecording()) o.dump.back() += " op=ClearByCopy";
+    if (PassDumpRecording() && !o.dump.empty()) o.dump.back() += " op=ClearByCopy";
     DumpWrite(o, texture);
     ForEachSubresource(texture, count, ranges, [&](u32, u32 level, u32 layer) {
         const NSUInteger lw = std::max<NSUInteger>(1, w >> level), lh = std::max<NSUInteger>(1, h >> level);
