@@ -5,6 +5,9 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <mutex>
+#include <string>
 #include <ranges>
 #include <boost/container/small_vector.hpp>
 #include "bbport_toggles.h"
@@ -135,6 +138,52 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
 
 Runtime::~Runtime() = default;
 
+namespace {
+// bbport BB_CLEAR_STALL_TRACE=<file> (diagnostics): when the file exists, the next two frames'
+// clears, image uploads, downloads, copies, resolves, usage upgrades and buffer copies are printed
+// in recording order with the images' addresses, sizes and formats, and the file is removed: what
+// touched an image just before a clear that stalls on the GPU.
+bool ClearTraceOn() {
+    static const char* path = std::getenv("BB_CLEAR_STALL_TRACE");
+    if (!path) {
+        return false;
+    }
+    static std::mutex mutex;
+    static u32 frame = ~0u, frames_left = 0;
+    std::scoped_lock lock{mutex};
+    const u32 now = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (now != frame) {
+        frame = now;
+        if (frames_left) {
+            if (--frames_left == 0) {
+                std::printf("Clear trace: end\n");
+            } else {
+                std::printf("Clear trace: frame %u\n", now);
+            }
+        } else if (std::filesystem::exists(path)) {
+            std::filesystem::remove(path);
+            frames_left = 2;
+            std::printf("Clear trace: frame %u\n", now);
+        }
+    }
+    return frames_left != 0;
+}
+std::string TraceImage(const VideoCore::Image* image) {
+    if (!image) {
+        return "-";
+    }
+    return fmt::format("{:#x} {}x{} L{} fmt {}", image->info.guest_address, image->info.size.width,
+                       image->info.size.height, image->info.resources.layers,
+                       u32(image->info.pixel_format));
+}
+void ClearTrace(const char* what, const VideoCore::Image* a, const VideoCore::Image* b = nullptr) {
+    if (ClearTraceOn()) {
+        std::printf("Clear trace: %s %s%s%s\n", what, TraceImage(a).c_str(), b ? " -> " : "",
+                    b ? TraceImage(b).c_str() : "");
+    }
+}
+} // namespace
+
 void Runtime::TickFrame() {
     staging_pool.TickFrame();
 }
@@ -263,12 +312,18 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
 
 void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                             std::span<const VideoCore::Backend::BufferImageCopy> download_copies) {
+    ClearTrace("download", src);
     const auto regions = ConvertRegions<vk::BufferImageCopy>(download_copies);
     DownloadImage(src, dst, std::span<const vk::BufferImageCopy>{regions});
 }
 
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
+    if (ClearTraceOn()) {
+        std::printf("Clear trace: copy buffer %#llx+%#zx -> %#llx+%#zx, %zu regions\n",
+                    (unsigned long long)src->CpuAddr(), src->SizeBytes(),
+                    (unsigned long long)dst->CpuAddr(), dst->SizeBytes(), copies.size());
+    }
     scheduler.EndRendering();
 
     // bbport: many regions (HLE copy shaders) are tracked as one bounding range per buffer:
@@ -656,6 +711,7 @@ bool DropOverwrittenClear(VideoCore::Image* dst, Covers&& covers) {
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
+    ClearTrace("upload", dst);
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
     DropOverwrittenClear(dst, [&](u32 level, u32 first_layer, u32 layers) {
@@ -730,6 +786,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
 }
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
+    ClearTrace("copy image", src, dst);
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 
     // Format mismatch warning (safe but useful)
@@ -845,6 +902,7 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
+    ClearTrace("copy image (buffer)", src, dst);
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
     ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
@@ -905,6 +963,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
+    ClearTrace("copy mip", src, dst);
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
     const auto mip_block_h = std::max(dst->info.size.height >> (mip + dst_dim), 1u);
@@ -960,6 +1019,7 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
 }
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
+    ClearTrace("copy color/depth", src, dst);
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
         if (instance.IsMaintenance8Supported() ||
             src->info.props.is_depth == dst->info.props.is_depth) {
@@ -995,6 +1055,7 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
 
 void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
                                const VideoCore::SubresourceRange& sub_range) {
+    ClearTrace("copy depth/stencil", src, dst);
     scheduler.EndRendering();
 
     bool needs_flush =
@@ -1040,6 +1101,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
 void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                            const VideoCore::SubresourceRange& src_range,
                            const VideoCore::SubresourceRange& dst_range) {
+    ClearTrace("resolve", src, dst);
     SetBackingSamples(dst, 1, false);
     scheduler.EndRendering();
 
@@ -1189,6 +1251,7 @@ bool Runtime::TakePendingClear(VideoCore::Image* image, const VideoCore::Subreso
 
 void Runtime::RecordClear(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                           const VideoCore::Backend::ClearColor& value) {
+    ClearTrace("CLEAR", dst);
     vk::ClearColorValue color{};
     color.uint32 = value;
     scheduler.EndRendering();
@@ -1308,6 +1371,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 // The old backing stays (unused) until the image goes: draws already handed to the recording
 // thread may still name it.
 void Runtime::UpgradeUsage(VideoCore::Image* image) {
+    ClearTrace("upgrade usage", image);
     BeforeImageAccess();
     VideoCore::Image::BackingImage* old_backing = image->backing;
     if (!old_backing || old_backing->num_samples > 1) {
