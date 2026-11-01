@@ -339,6 +339,12 @@ private:
     bool FilterDraw();
     u32 ExpandRects(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
     u32 ExpandFixedQuads(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    /// bbport BB_SHADOW_REUSE_PROBE (measurement): see DrawRecord.
+    void ShadowReuseProbe(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    /// bbport BB_SHADOW_TRACE (diagnostics): see vk_rasterizer.cpp.
+    bool ShadowTraceFrame();
+    void ShadowTraceDraw(const GraphicsPipeline* pipeline);
+    void ShadowTraceDispatch(const ComputePipeline* pipeline);
     static bool SkipsEmptyDraws();
     bool IsEmptyDraw(const GraphicsPipeline* pipeline) const;
     bool FilterDrawPasses() const;
