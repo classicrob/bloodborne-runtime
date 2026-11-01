@@ -283,6 +283,8 @@ bool PassStats();
 bool PassDumpRecording();
 void PassDumpPresent();
 void PassDumpCommit(Owned& o);
+/// Experiment bit 9: keeps this command buffer's fences until the GPU is done with it.
+void RetainFencesUntilDone(Owned& o);
 bool CopyComputeStats();
 Stats& GetStats();
 /// The image of a view (VK_NULL_HANDLE: not known).

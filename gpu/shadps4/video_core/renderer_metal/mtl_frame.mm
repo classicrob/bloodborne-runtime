@@ -262,8 +262,13 @@ u64 AttachmentBytes(MTLRenderPassAttachmentDescriptor* a);
 //   and the first one of a command buffer waits for the previous command buffer's last render.
 bool Fenced(Owned& o) {
     if (o.fenced < 0) {
-        // Without a residency set the declarations are also what keeps the memory resident.
-        o.fenced = BbToggle::Experiment(1ull << 9) && residency ? 1 : 0;
+        // Without a residency set the declarations are also what keeps the memory resident;
+        // BB_METAL_RENDER_WRITES=1 relies on render encoders declaring their writes.
+        static const bool render_writes = [] {
+            const char* env = std::getenv("BB_METAL_RENDER_WRITES");
+            return env && env[0] == '1';
+        }();
+        o.fenced = BbToggle::Experiment(1ull << 9) && residency && !render_writes ? 1 : 0;
     }
     return o.fenced == 1;
 }
@@ -275,17 +280,34 @@ id<MTLFence> LastRenderFence() {
     static id<MTLFence> fence = [device newFence];
     return fence;
 }
+/// Both global fences updated once by a submitted encoder before any recorded work, so that no
+/// wait ever refers to a fence nothing updated.
+void SeedOrderFences() {
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    cmd.label = @"bbport fence seed";
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc updateFence:NonrenderFence()];
+    [enc updateFence:LastRenderFence()];
+    [enc endEncoding];
+    [cmd commit];
+}
+// The global fences are updated and the command-buffer boundary waited in both modes, so a
+// command buffer of either mode orders against one of the other (the bit can flip between
+// command buffers recorded on different threads).
+constexpr MTLRenderStages kRenderStages = MTLRenderStageVertex | MTLRenderStageFragment;
 void FenceRenderStart(Owned& o) {
-    [o.render waitForFence:NonrenderFence() beforeStages:MTLRenderStageVertex];
+    [o.render waitForFence:NonrenderFence() beforeStages:kRenderStages];
 }
 void FenceRenderEnd(Owned& o) {
+    [o.render updateFence:LastRenderFence() afterStages:kRenderStages];
+    if (!Fenced(o)) {
+        return;
+    }
     if (o.fence_next == o.fence_pool.size()) {
         o.fence_pool.push_back([device newFence]);
     }
     id<MTLFence> fence = o.fence_pool[o.fence_next++];
-    const MTLRenderStages stages = MTLRenderStageVertex | MTLRenderStageFragment;
-    [o.render updateFence:fence afterStages:stages];
-    [o.render updateFence:LastRenderFence() afterStages:stages];
+    [o.render updateFence:fence afterStages:kRenderStages];
     o.render_fences.push_back(fence);
 }
 template <typename Encoder>
@@ -294,14 +316,14 @@ void FenceNonrenderStart(Owned& o, Encoder encoder) {
         [encoder waitForFence:LastRenderFence()];
         o.nonrender_seen = true;
     }
-    if (o.war_pending) {
+    if (o.war_pending && Fenced(o)) {
         for (id<MTLFence> fence : o.render_fences) {
             [encoder waitForFence:fence];
         }
         o.render_fences.clear();
         o.fence_next = 0; // every fence in the pool has been waited on: free again
-        o.war_pending = false;
     }
+    o.war_pending = false;
 }
 template <typename Encoder>
 void FenceNonrenderEnd(Encoder encoder) {
@@ -418,17 +440,13 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
     }
     if (o.compute) {
         DumpClose(o);
-        if (Fenced(o)) {
-            FenceNonrenderEnd(o.compute);
-        }
+        FenceNonrenderEnd(o.compute);
         [o.compute endEncoding];
         o.compute = nil;
     }
     if (o.blit) {
         DumpClose(o);
-        if (Fenced(o)) {
-            FenceNonrenderEnd(o.blit);
-        }
+        FenceNonrenderEnd(o.blit);
         [o.blit endEncoding];
         o.blit = nil;
     }
@@ -474,9 +492,7 @@ id<MTLComputeCommandEncoder> ComputeEncoder(Owned& o) {
         o.compute = [o.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
     }
     UseAddressBuffers(o.compute, false);
-    if (Fenced(o)) {
-        FenceNonrenderStart(o, o.compute);
-    }
+    FenceNonrenderStart(o, o.compute);
     return o.compute;
 }
 
@@ -498,9 +514,7 @@ id<MTLBlitCommandEncoder> BlitEncoder(Owned& o) {
         o.blit = [o.cmd blitCommandEncoder];
     }
     o.dump_count = 1;
-    if (Fenced(o)) {
-        FenceNonrenderStart(o, o.blit);
-    }
+    FenceNonrenderStart(o, o.blit);
     return o.blit;
 }
 
@@ -1139,6 +1153,7 @@ void Init(VkDevice dev, id<MTLCommandQueue> q, PFN_vkExportMetalObjectsEXT expor
     if (residency) {
         [residency commit];
         [queue addResidencySet:residency];
+        SeedOrderFences();
     } else {
         std::printf("Metal frame: no residency set (%s): every device-address buffer is declared "
                     "on each encoder instead\n",
@@ -1152,26 +1167,31 @@ void EndEncoders(Owned& o) {
         DumpClose(o);
     }
     if (o.render) {
-        if (Fenced(o)) {
-            FenceRenderEnd(o);
-        }
+        FenceRenderEnd(o);
         [o.render endEncoding];
         o.render = nil;
     }
     if (o.compute) {
-        if (Fenced(o)) {
-            FenceNonrenderEnd(o.compute);
-        }
+        FenceNonrenderEnd(o.compute);
         [o.compute endEncoding];
         o.compute = nil;
     }
     if (o.blit) {
-        if (Fenced(o)) {
-            FenceNonrenderEnd(o.blit);
-        }
+        FenceNonrenderEnd(o.blit);
         [o.blit endEncoding];
         o.blit = nil;
     }
+}
+
+void RetainFencesUntilDone(Owned& o) {
+    if (o.fence_pool.empty()) {
+        return;
+    }
+    // The command buffer does not retain what it uses (unretained references).
+    __block std::vector<id<MTLFence>> fences = o.fence_pool;
+    [o.cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      fences.clear();
+    }];
 }
 
 void ReturnScratchWhenDone(Owned& o) {
@@ -1203,6 +1223,7 @@ void CommitChunk(Owned& o) {
         }];
     }
     MetalGpuTiming::Commit(o.timing, o.cmd);
+    RetainFencesUntilDone(o);
     [o.cmd commit];
     o.cmd = [queue commandBufferWithUnretainedReferences];
     o.cmd.label = @"bbport Metal path";
@@ -1475,9 +1496,7 @@ void Barrier(Owned& o) {
     o.war_pending = true; // experiment bit 9: the next compute/blit encoder waits for renders
     if (o.blit) {
         DumpClose(o);
-        if (Fenced(o)) {
-            FenceNonrenderEnd(o.blit);
-        }
+        FenceNonrenderEnd(o.blit);
         [o.blit endEncoding];
         o.blit = nil;
     }
@@ -1623,9 +1642,7 @@ void EndRendering(Owned& o) {
     }
     if (o.render) {
         DumpClose(o);
-        if (Fenced(o)) {
-            FenceRenderEnd(o);
-        }
+        FenceRenderEnd(o);
         [o.render endEncoding];
         o.render = nil;
     }

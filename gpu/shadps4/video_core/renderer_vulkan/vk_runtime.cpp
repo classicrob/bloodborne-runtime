@@ -1475,14 +1475,13 @@ void Runtime::FlushBarriers() {
         if (state.depth_stencil_attachment.image_view) {
             images[n++] = VkImage(MetalLayer::ImageOfView(state.depth_stencil_attachment.image_view));
         }
-        // Experiment bit 9: a barrier on one of its attachments that keeps it an attachment
-        // (only attachment accesses after it: a layout change, which Metal does not have) does
-        // not count either. Sampling an attachment still ends the pass.
+        // Barriers on its attachments that keep them attachments (a layout change) are only
+        // counted: keeping the pass open for them removed no pass (measured, dropped).
         constexpr auto attachment_only =
             vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite |
             vk::AccessFlagBits2::eDepthStencilAttachmentRead |
             vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
-        const bool stays_attachment_ok = BbToggle::Experiment(1ull << 9);
+        constexpr bool stays_attachment_ok = false;
         for (const auto& barrier : image_barriers) {
             const VkImage image = static_cast<VkImage>(barrier.image);
             const bool stays_attachment =
