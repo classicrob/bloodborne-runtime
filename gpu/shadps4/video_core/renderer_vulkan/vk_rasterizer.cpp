@@ -2471,7 +2471,7 @@ void Rasterizer::NoteDecodedPacket(bool work) {
     Flush();
     static std::atomic<u64> commits{0};
     const u64 n = commits.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n == 1 || n % 5000 == 0) {
+    if (n == 1 || n % 500 == 0) {
         std::printf("Early commits (the GPU had run dry, experiment bit 15): %llu\n",
                     (unsigned long long)n);
     }
