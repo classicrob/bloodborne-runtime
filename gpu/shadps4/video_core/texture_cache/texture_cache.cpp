@@ -7,6 +7,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <mutex>
+#include <unordered_map>
 
 #include "bbport_toggles.h"
 #include "bbport_button_prompts.h"
@@ -317,6 +320,32 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     });
 }
 
+// bbport BB_IMAGE_CREATE_LOG=1 (diagnostics): every image the cache creates, with why, its address,
+// size, layers, levels and format, and how many times an image at that address has been created
+// (first 4,000 lines). An image created again and again shows as a rising count.
+namespace {
+void LogImageCreate(const VideoCore::ImageInfo& info, const char* why) {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_IMAGE_CREATE_LOG");
+        return env && env[0] == '1';
+    }();
+    if (!on) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_map<u64, u32> counts;
+    static u32 lines = 0;
+    std::scoped_lock lock{mutex};
+    const u32 n = ++counts[info.guest_address];
+    if (lines++ < 4000) {
+        std::printf("Image create (%s): %#llx+%#x %ux%u layers %u levels %u format %u, #%u\n", why,
+                    (unsigned long long)info.guest_address, info.guest_size, info.size.width,
+                    info.size.height, info.resources.layers, info.resources.levels,
+                    u32(info.pixel_format), n);
+    }
+}
+} // namespace
+
 // bbport BB_IMAGE_WATCH=addr (diagnostics): how the image at that address is used (first 300).
 void TextureCache::WatchImage(const Image& image, const char* what) {
     static const u64 watched = [] {
@@ -421,6 +450,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
         new_info.UpdateSize();
         const auto new_image_id = slot_images.insert(device, runtime, slot_image_views, new_info);
+        LogImageCreate(new_info, "recreate");
         RegisterImage(new_image_id);
 
         // Inherit image usage
@@ -675,6 +705,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     const auto new_image_id = slot_images.insert(device, runtime, slot_image_views, info);
+    LogImageCreate(info, "expand");
     // bbport: the larger image keeps the usages the old one was given (lazy texture usages; the
     // game grows mip chains a level at a time).
     if (slot_images[image_id].HasAllowedUsage()) {
@@ -803,6 +834,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // Create and register a new image
     if (!image_id) {
         image_id = slot_images.insert(device, runtime, slot_image_views, info);
+        LogImageCreate(info, "new");
         // bbport: a texture first bound as storage or in another pixel format gets those usages
         // now rather than an upgrade copy at its first view (lazy texture usages).
         if (auto& created = slot_images[image_id]; created.NeededUsage(desc.view_info)) {
@@ -964,6 +996,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
             info.guest_size = desc.info.stencil_size;
             info.size = desc.info.size;
             stencil_id = slot_images.insert(device, runtime, slot_image_views, info);
+            LogImageCreate(info, "stencil");
             RegisterImage(stencil_id);
         }
         Image& stencil_image = slot_images[stencil_id];
