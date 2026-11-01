@@ -48,6 +48,7 @@ bool enabled = false;
 bool split = false;    ///< BB_METAL_GPU_TIMING=2: vertex and fragment stage ends sampled too
 unsigned every = 1;    ///< BB_METAL_GPU_TIMING_EVERY: one frame in this many sampled
 unsigned seq_from = 0, seq_to = 0; ///< BB_METAL_GPU_TIMING_SEQ=from-to: these positions in order
+std::string seq_anchor; ///< BB_METAL_GPU_TIMING_SEQ=<text>:<count>: from the first encoder named so
 id<MTLDevice> device;
 id<MTLCounterSet> timestamps;
 std::mutex pool_mutex;
@@ -222,7 +223,16 @@ void Init(id<MTLDevice> dev) {
     last_report = steady0;
     split = env[0] == '2';
     if (const char* q = std::getenv("BB_METAL_GPU_TIMING_SEQ")) {
-        std::sscanf(q, "%u-%u", &seq_from, &seq_to);
+        const std::string v{q};
+        if (const auto colon = v.rfind(':'); colon != std::string::npos) {
+            // Positions vary from frame to frame: count from the first encoder whose label holds
+            // the text (a pass signature or shader name).
+            seq_anchor = v.substr(0, colon);
+            seq_from = 0;
+            seq_to = unsigned(std::max(1, std::atoi(v.c_str() + colon + 1))) - 1;
+        } else {
+            std::sscanf(q, "%u-%u", &seq_from, &seq_to);
+        }
     }
     if (const char* n = std::getenv("BB_METAL_GPU_TIMING_EVERY")) {
         every = std::max(1, std::atoi(n));
@@ -552,6 +562,20 @@ void Report() {
                 }
             }
         }
+        const auto label_of = [](const Encoder& x) {
+            return (x.kind == 'R' ? "R " + x.signature : x.kind == 'C' ? "C " + x.shader : std::string("blit")) +
+                   (x.kind == 'R' && !x.shader.empty() ? " vs " + x.shader : std::string());
+        };
+        long anchor = 0;
+        if (!seq_anchor.empty()) {
+            anchor = -1;
+            for (size_t i = 0; i < list.size(); ++i) {
+                if (label_of(list[i]->encoder).find(seq_anchor) != std::string::npos) {
+                    anchor = long(i);
+                    break;
+                }
+            }
+        }
         const double first = list.front()->start;
         double reach = first, last = first;
         const Record* reaching = list.front();
@@ -577,15 +601,15 @@ void Report() {
                 t.encoders += 1;
                 t.work += e.work;
             }
-            if (seq_to && position >= seq_from && position <= seq_to) {
-                Step& st = sequence[position];
+            const long rel = anchor < 0 ? -1 : long(position) - anchor;
+            if ((seq_to || !seq_anchor.empty()) && rel >= long(seq_from) && rel <= long(seq_to)) {
+                Step& st = sequence[unsigned(rel)];
                 st.exclusive += exclusive[r];
                 st.span += ms;
                 st.gap += r->start > reach ? (r->start - reach) / 1e6 : 0.0;
                 st.count += 1;
                 st.work += e.work;
-                st.label = (e.kind == 'R' ? "R " + e.signature : e.kind == 'C' ? "C " + e.shader : std::string("blit")) +
-                           (e.kind == 'R' && !e.shader.empty() ? " vs " + e.shader : std::string());
+                st.label = label_of(e);
             }
             ++position;
             sum_all += ms;
@@ -658,8 +682,9 @@ void Report() {
     }
     print("costliest encoders by position in the frame (GPU order)", positions, 20);
     if (!sequence.empty()) {
-        std::printf("  positions %u-%u in GPU order (ms per occurrence: exclusive, span, idle before; "
-                    "share of frames, draws):\n", seq_from, seq_to);
+        std::printf("  positions %u-%u in GPU order%s%s (ms per occurrence: exclusive, span, idle before; "
+                    "share of frames, draws):\n", seq_from, seq_to,
+                    seq_anchor.empty() ? "" : " from the first encoder named ", seq_anchor.c_str());
         for (const auto& [pos, st] : sequence) {
             std::printf("    #%-4u %6.3f %6.3f %6.3f %5.2f %5.1f  %s\n", pos, st.exclusive / st.count,
                         st.span / st.count, st.gap / st.count, st.count / n, st.work / st.count,
