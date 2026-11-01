@@ -199,6 +199,34 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
+    // bbport BB_IMAGE_DOWNLOAD_LOG=1 (diagnostics): each image downloaded to guest memory, once
+    // per address (size, format, tiling, flags), and every 5 s how many downloads there were.
+    static const bool download_log = [] {
+        const char* env = std::getenv("BB_IMAGE_DOWNLOAD_LOG");
+        return env && env[0] == '1';
+    }();
+    if (download_log) {
+        static std::mutex log_mutex;
+        static std::unordered_map<u64, u64> per_address;
+        static u64 total = 0, bytes = 0;
+        static auto last = std::chrono::steady_clock::now();
+        std::scoped_lock log_lock{log_mutex};
+        ++total;
+        bytes += image.info.guest_size;
+        if (per_address[image.info.guest_address]++ == 0) {
+            std::printf("Image download: %#llx+%#x %ux%u layers %u format %u tiled %d flags %#x\n",
+                        (unsigned long long)image.info.guest_address, image.info.guest_size,
+                        image.info.size.width, image.info.size.height, image.info.resources.layers,
+                        u32(image.info.pixel_format), int(image.info.props.is_tiled),
+                        u32(image.flags));
+        }
+        if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
+            last = std::chrono::steady_clock::now();
+            std::printf("Image downloads (5 s): %llu, %.1f MiB, %zu images\n",
+                        (unsigned long long)total, double(bytes) / (1 << 20), per_address.size());
+            total = bytes = 0;
+        }
+    }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
