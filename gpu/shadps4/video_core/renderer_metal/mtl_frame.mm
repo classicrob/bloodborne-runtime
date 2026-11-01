@@ -20,6 +20,7 @@
 #include <vulkan/vulkan_metal.h>
 #include "video_core/renderer_metal/mtl_depth_stencil.h"
 #include "video_core/renderer_metal/mtl_pso_cache.h"
+#include "video_core/renderer_vulkan/vk_pipeline_key.h"
 #include "video_core/renderer_metal/mtl_raster_util.h"
 #include "video_core/renderer_metal/mtl_shader.h"
 #include "video_core/renderer_metal/mtl_shadow.h"
@@ -286,6 +287,59 @@ void NoteRenderEncoder(MTLRenderPassDescriptor* rp, bool reopened) {
     }
 }
 
+/// Experiment bit 12: the first draw of a pass that loads its one colour target (no depth or
+/// stencil) is a rect list without blending that writes every channel over a viewport and
+/// scissor covering the whole target, so nothing loaded survives: the pass loads nothing
+/// (DontCare). Full-screen passes like the glare/bloom pyramid. The rect itself is assumed to
+/// cover the viewport (as the game's full-screen rects do); frame dumps prove it.
+void SkipOverwrittenLoad(Owned& o, MTLRenderPassDescriptor* rp) {
+    if (!BbToggle::Experiment(1ull << 12) || !o.graphics || !o.graphics->rect_list ||
+        !o.graphics->render || rp.depthAttachment.texture || rp.stencilAttachment.texture) {
+        return;
+    }
+    MTLRenderPassColorAttachmentDescriptor* c = rp.colorAttachments[0];
+    if (!c.texture || c.loadAction != MTLLoadActionLoad) {
+        return;
+    }
+    for (u32 i = 1; i < 8; ++i) {
+        if (rp.colorAttachments[i].texture) {
+            return;
+        }
+    }
+    const auto& key = o.graphics->render->key;
+    using Mask = VideoCore::Backend::ColorWriteMask;
+    const u32 mask = u32(key.write_masks[0]);
+    const MTLPixelFormat f = c.texture.pixelFormat;
+    const u32 needed = f == MTLPixelFormatRG11B10Float || f == MTLPixelFormatRGB9E5Float
+                           ? u32(Mask::R) | u32(Mask::G) | u32(Mask::B)
+                           : u32(Mask::All);
+    if ((mask & needed) != needed || Vulkan::AttachmentBlendState(key, 0).enable) {
+        return;
+    }
+    const double w = double(std::max<NSUInteger>(1, c.texture.width >> c.level));
+    const double h = double(std::max<NSUInteger>(1, c.texture.height >> c.level));
+    if (o.viewports.empty()) {
+        return;
+    }
+    const VkViewport& v = o.viewports[0];
+    const double vx0 = std::min(v.x, v.x + v.width), vx1 = std::max(v.x, v.x + v.width);
+    const double vy0 = std::min(v.y, v.y + v.height), vy1 = std::max(v.y, v.y + v.height);
+    if (vx0 > 0 || vy0 > 0 || vx1 < w || vy1 < h) {
+        return;
+    }
+    if (!o.scissors.empty()) {
+        const VkRect2D& r = o.scissors[0];
+        if (r.offset.x > 0 || r.offset.y > 0 || r.offset.x + double(r.extent.width) < w ||
+            r.offset.y + double(r.extent.height) < h) {
+            return;
+        }
+    }
+    c.loadAction = MTLLoadActionDontCare;
+    if (PassStats()) {
+        ++stats.loads_skipped;
+    }
+}
+
 /// The render encoder of the current pass, opened on first use: a pass without draws costs
 /// nothing unless it clears (EndRendering), and work before its first draw (tessellation
 /// kernels) goes before it instead of splitting it.
@@ -302,6 +356,9 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
         DumpClose(o);
         [o.blit endEncoding];
         o.blit = nil;
+    }
+    if (!o.pass_opened) {
+        SkipOverwrittenLoad(o, o.pass_first);
     }
     if (PassStats()) {
         NoteRenderEncoder(o.pass_opened ? o.pass : o.pass_first, o.pass_opened);

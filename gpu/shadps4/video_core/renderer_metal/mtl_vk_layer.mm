@@ -221,6 +221,8 @@ void Report() {
                         x(s.barrier_images), x(s.barrier_images_off_pass),
                         x(s.barrier_graphics_write), x(s.barrier_other), x(s.barrier_kept),
                         x(s.barrier_layout_only));
+            std::printf("Metal passes per frame: %.1f colour loads skipped (overwritten)\n",
+                        x(s.loads_skipped));
             std::printf("Metal passes per frame: attachments loaded %.1f MB (%.1f MB by reopened "
                         "passes), stored %.1f MB\n",
                         x(s.load_bytes) / 1e6, x(s.reopen_load_bytes) / 1e6,
