@@ -626,7 +626,13 @@ void Report() {
                 "(present and unsampled work included); %.0f%% of encoders sampled\n",
                 n, span / n, busy / n, sum_all / n, (sum_all - busy) / n, idle / n, gap_count / n,
                 between / n, s + u ? 100.0 * double(s) / double(s + u) : 0.0);
+    // BB_METAL_GPU_TIMING_TOP=N: N rows per table instead of each table's default.
+    static const size_t top_rows = [] {
+        const char* v = std::getenv("BB_METAL_GPU_TIMING_TOP");
+        return v ? size_t(std::max(1, std::atoi(v))) : size_t(0);
+    }();
     const auto print = [&](const char* title, const auto& table, size_t top) {
+        top = top_rows ? top_rows : top;
         std::vector<std::pair<std::string, Sum>> rows;
         for (const auto& [k, v] : table) rows.emplace_back(k, v);
         std::sort(rows.begin(), rows.end(),
