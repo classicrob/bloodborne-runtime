@@ -685,12 +685,12 @@ bool Runtime::CanResampleDepth(VideoCore::Backend::Format format, bool stencil) 
 }
 
 namespace {
-/// bbport (experiment bit 15): a deferred clear whose whole range the copy about to be recorded
+/// bbport (experiment bit 23; was bit 15): a deferred clear whose whole range the copy about to be recorded
 /// overwrites is dropped instead of recorded first (a clear pass, and its store, for nothing).
 /// `covers(level, first_layer, layers)`: the copy writes all of that subresource.
 template <typename Covers>
 bool DropOverwrittenClear(VideoCore::Image* dst, Covers&& covers) {
-    if (!dst->pending_clear || !BbToggle::Experiment(1ull << 15)) {
+    if (!dst->pending_clear || !BbToggle::Experiment(1ull << 23)) {
         return false;
     }
     const auto& range = dst->pending_clear_range;

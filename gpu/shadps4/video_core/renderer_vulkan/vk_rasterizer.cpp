@@ -3084,6 +3084,17 @@ void NoteResStats(const Pipeline* pipeline) {
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     BB_SECTION(BindResources);
+    // bbport (BB_TILE_BACK_LOG): which programs a write-back of an image read as a buffer serves.
+    static const bool tile_back_log = std::getenv("BB_TILE_BACK_LOG") != nullptr;
+    if (tile_back_log) {
+        if (pipeline->IsCompute()) {
+            VideoCore::SetTileBackPrograms(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash, 0);
+        } else {
+            const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+            const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            VideoCore::SetTileBackPrograms(vs ? vs->pgm_hash : 0, ps ? ps->pgm_hash : 0);
+        }
+    }
     NoteResStats(pipeline);
     {
         // bbport BB_HLE_STATS=1 (diagnostics): how often the compute shader substitutions fire.
@@ -3922,6 +3933,37 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
     // Ensure shader only has 2 bound buffers
     const auto& cs_pgm = CsRegs();
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
+    {
+        // bbport BB_COPY_HLE_DEBUG=<program hash> (diagnostics): what this function's checks see
+        // for that compute program, once per distinct line.
+        static const u64 copy_debug = [] {
+            const char* env = std::getenv("BB_COPY_HLE_DEBUG");
+            return env ? std::strtoull(env, nullptr, 16) : 0ull;
+        }();
+        if (copy_debug && info.pgm_hash == copy_debug) {
+            std::string line = fmt::format("threads {} buffers {} images {} dim_x {}",
+                                           cs_pgm.num_thread_x.full, ShaderBufferCount(info),
+                                           info.images.size(), cs_pgm.dim_x);
+            for (u32 b = 0; b < info.buffers.size(); ++b) {
+                const auto& d = info.buffers[b];
+                const auto sharp = d.GetSharp(info);
+                line += fmt::format(" | buf{} written {} formatted {} {:#x}+{:#x}", b, d.is_written,
+                                    d.is_formatted, u64(sharp.base_address), sharp.GetSize());
+                if (const auto id = texture_cache.FindImageFromRange(sharp.base_address,
+                                                                     sharp.GetSize(), false)) {
+                    const auto& im = texture_cache.GetImage(id).info;
+                    line += fmt::format(" image {}x{} size {:#x} pitch {} bits {}", im.size.width,
+                                        im.size.height, im.guest_size, im.pitch, im.num_bits);
+                }
+            }
+            static std::mutex mutex;
+            static std::unordered_set<std::string> printed;
+            std::scoped_lock lock{mutex};
+            if (printed.size() < 40 && printed.insert(line).second) {
+                std::printf("Copy HLE debug: %s\n", line.c_str());
+            }
+        }
+    }
     if (cs_pgm.num_thread_x.full != 64 || ShaderBufferCount(info) != 2 || !info.images.empty()) {
         return false;
     }
@@ -3937,17 +3979,40 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
     const AmdGpu::Buffer buf0 = desc0.GetSharp(info);
     const AmdGpu::Buffer buf1 = desc1.GetSharp(info);
     if (buf0.GetSize() != buf1.GetSize() || cs_pgm.dim_x != (buf0.GetSize() / 256)) {
+        if (std::getenv("BB_TAIL_COPY_DEBUG") && BbToggle::Experiment(1ull << 21) &&
+            buf0.GetSize() == 0x241800) {
+            static std::atomic<u64> n{0};
+            if (n++ % 4096 == 0) {
+                std::printf("Tail copy rejected: sizes or dim_x (buffers %#x %#x, dim_x %u), %llu\n",
+                            buf0.GetSize(), buf1.GetSize(), cs_pgm.dim_x,
+                            (unsigned long long)n.load());
+            }
+        }
         return false;
     }
 
     // Find images the buffer alias
     const auto image0_id = texture_cache.FindImageFromRange(buf0.base_address, buf0.GetSize());
     if (!image0_id) {
+        if (std::getenv("BB_TAIL_COPY_DEBUG") && BbToggle::Experiment(1ull << 21)) {
+            static std::atomic<u64> n{0};
+            if (n++ % 4096 == 0) {
+                std::printf("Tail copy rejected: no valid source image (buffer %#x), %llu\n",
+                            buf0.GetSize(), (unsigned long long)n.load());
+            }
+        }
         return false;
     }
     const auto image1_id =
         texture_cache.FindImageFromRange(buf1.base_address, buf1.GetSize(), false);
     if (!image1_id) {
+        if (std::getenv("BB_TAIL_COPY_DEBUG") && BbToggle::Experiment(1ull << 21)) {
+            static std::atomic<u64> n{0};
+            if (n++ % 4096 == 0) {
+                std::printf("Tail copy rejected: no destination image (buffer %#x), %llu\n",
+                            buf1.GetSize(), (unsigned long long)n.load());
+            }
+        }
         return false;
     }
 
@@ -3955,9 +4020,50 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
     VideoCore::Image& image0 = texture_cache.GetImage(image0_id);
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
     if (image0.info.guest_size != image1.info.guest_size ||
-        image0.info.pitch != image1.info.pitch || image0.info.guest_size != buf0.GetSize() ||
-        image0.info.num_bits != image1.info.num_bits) {
+        image0.info.pitch != image1.info.pitch || image0.info.num_bits != image1.info.num_bits) {
         return false;
+    }
+    // bbport (experiment bit 21): the engine's copies of its 960x540 targets copy 6 KiB past the
+    // image (the buffers cover the image plus a tail). Taken as an image copy plus a buffer copy
+    // of the tail when the tail is small, both buffers start at their images, and no cached image
+    // covers either tail: the game's memory and images end up as the copy leaves them.
+    u32 tail = 0;
+    // bbport BB_TAIL_COPY_DEBUG=1 (diagnostics): why a copy with a tail is not taken, once each.
+    static const bool tail_debug = std::getenv("BB_TAIL_COPY_DEBUG") != nullptr;
+    const auto reject = [&](const char* why) {
+        if (tail_debug) {
+            static std::mutex mutex;
+            static std::unordered_set<std::string> printed;
+            std::scoped_lock lock{mutex};
+            if (printed.insert(why).second) {
+                std::printf("Tail copy rejected: %s (buffer %#x, image %#x)\n", why,
+                            buf0.GetSize(), image0.info.guest_size);
+            }
+        }
+        return false;
+    };
+    if (image0.info.guest_size != buf0.GetSize()) {
+        const u64 image_size = image0.info.guest_size;
+        if (!BbToggle::Experiment(1ull << 21)) {
+            return false;
+        }
+        if (buf0.GetSize() <= image_size || buf0.GetSize() - image_size > (64u << 10)) {
+            return reject("tail size");
+        }
+        if (image0.info.guest_address != buf0.base_address ||
+            image1.info.guest_address != buf1.base_address) {
+            return reject("buffer not at its image");
+        }
+        bool tail_has_image = false;
+        for (const VAddr base : {VAddr(buf0.base_address), VAddr(buf1.base_address)}) {
+            texture_cache.ForEachImageInRegion(
+                base + image_size, buf0.GetSize() - image_size,
+                [&](VideoCore::ImageId, VideoCore::Image&) { tail_has_image = true; });
+        }
+        if (tail_has_image) {
+            return reject("an image over the tail");
+        }
+        tail = u32(buf0.GetSize() - image_size);
     }
 
     // Perform image copy
@@ -3982,6 +4088,20 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
         return false;
     }
     runtime.CopyColorAndDepth(&src_image, &dst_image);
+    if (tail) {
+        const VAddr src_tail = src_image.info.guest_address + src_image.info.guest_size;
+        const VAddr dst_tail = dst_image.info.guest_address + dst_image.info.guest_size;
+        const auto [src_buffer, src_offset] = buffer_cache.ObtainBuffer(src_tail, tail, false);
+        const auto [dst_buffer, dst_offset] = buffer_cache.ObtainBuffer(dst_tail, tail, true);
+        const VideoCore::Backend::BufferCopy region{
+            .src_offset = src_offset, .dst_offset = dst_offset, .size = tail};
+        runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&region, 1});
+        static std::atomic<u64> tail_copies{0};
+        if (const u64 n = ++tail_copies; n == 1 || n % 4096 == 0) {
+            std::printf("Image copies with a tail: %llu (%u tail bytes)\n", (unsigned long long)n,
+                        tail);
+        }
+    }
     return true;
 }
 

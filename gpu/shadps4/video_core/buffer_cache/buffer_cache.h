@@ -65,6 +65,9 @@ public:
     static inline u64 generation = 1;
 };
 
+/// bbport (BB_TILE_BACK_LOG): the programs being bound on this thread (buffer_cache.cpp).
+void SetTileBackPrograms(u64 first, u64 second);
+
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
     static constexpr u64 ARENA_PAGE_BITS = 32;

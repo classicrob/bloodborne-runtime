@@ -3388,6 +3388,13 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<Backend::
     return staging.buffer;
 }
 
+// bbport (BB_TILE_BACK_LOG): the programs whose resources the rasterizer is binding on this
+// thread (vertex, pixel or compute), so a write-back names the shader that reads the image.
+thread_local std::array<u64, 2> tile_back_programs{};
+void SetTileBackPrograms(u64 first, u64 second) {
+    tile_back_programs = {first, second};
+}
+
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, u64 arena_offset,
                                              VAddr device_addr, u32 size) {
     if (auto type = texture_cache.IsMeta(device_addr)) {
@@ -3409,6 +3416,11 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, u64 arena_offs
     const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
     if (!image_id) {
         miss = {device_addr, size, generation};
+        return false;
+    }
+    // bbport experiment bit 20 (MEASUREMENT ONLY, changes the picture): the image is not written
+    // back into the game's memory for a buffer that reads it, to size what the round trips cost.
+    if (BbToggle::Experiment(1ull << 20)) {
         return false;
     }
     // bbport: the lookups above only read what the texture binding helper leaves alone; the
@@ -3447,8 +3459,24 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, u64 arena_offs
     // because a texel buffer reads it, with the age of its last GPU write in submissions.
     static const bool tile_back_log = std::getenv("BB_TILE_BACK_LOG") != nullptr;
     if (tile_back_log) {
+        // Each image, read range and reading programs once (the programs: vertex and pixel, or
+        // compute and 0), then a count every 4,096 write-backs.
+        static std::mutex seen_mutex;
+        static std::unordered_map<u64, u64> seen;
+        const u64 key = image.info.guest_address ^ (u64(size) << 40) ^
+                        (tile_back_programs[0] * 0x9E3779B97F4A7C15ull) ^ tile_back_programs[1];
+        u64 count;
+        {
+            std::scoped_lock lock{seen_mutex};
+            count = ++seen[key];
+        }
+        if (count == 1 || count % 4096 == 0) {
+            std::printf("Tile back: programs %016llx %016llx, x%llu\n",
+                        (unsigned long long)tile_back_programs[0],
+                        (unsigned long long)tile_back_programs[1], (unsigned long long)count);
+        }
         static std::atomic<u32> printed{0};
-        if (printed.fetch_add(1) < 400) {
+        if (count == 1 && printed.fetch_add(1) < 400) {
             std::printf("Tile back: image %#llx %ux%u fmt %u tile %u size %llu, read %#llx+%u; last "
                         "GPU write %lld submissions ago, flags %#x\n",
                         (unsigned long long)image.info.guest_address, image.info.size.width,
