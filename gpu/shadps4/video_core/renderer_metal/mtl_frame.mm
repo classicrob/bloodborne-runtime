@@ -248,6 +248,65 @@ void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
 }
 
 u64 AttachmentBytes(MTLRenderPassAttachmentDescriptor* a);
+
+// ---- Experiment bit 9: fenced ordering instead of guest-memory declarations on render encoders ----
+// Render encoders declared the guest memory (four pools, all of it) as read, and compute
+// encoders as read and write: Metal then serialised every render encoder against the compute
+// and blit encoders around it, dependent or not (Measurement: ~56 more gaps a frame). With
+// the bit, render encoders declare nothing (the memory stays resident through the residency
+// set) and fences keep the two real orderings:
+// - read after write: every render encoder waits for the latest compute/blit encoder (a fence
+//   each of them updates; compute and blit encoders stay ordered among themselves by tracking);
+// - write after read: a compute/blit encoder waits for the render encoders before it when the
+//   renderer recorded a barrier since its last wait (the barrier tracker found a conflict),
+//   and the first one of a command buffer waits for the previous command buffer's last render.
+bool Fenced(Owned& o) {
+    if (o.fenced < 0) {
+        // Without a residency set the declarations are also what keeps the memory resident.
+        o.fenced = BbToggle::Experiment(1ull << 9) && residency ? 1 : 0;
+    }
+    return o.fenced == 1;
+}
+id<MTLFence> NonrenderFence() {
+    static id<MTLFence> fence = [device newFence];
+    return fence;
+}
+id<MTLFence> LastRenderFence() {
+    static id<MTLFence> fence = [device newFence];
+    return fence;
+}
+void FenceRenderStart(Owned& o) {
+    [o.render waitForFence:NonrenderFence() beforeStages:MTLRenderStageVertex];
+}
+void FenceRenderEnd(Owned& o) {
+    if (o.fence_next == o.fence_pool.size()) {
+        o.fence_pool.push_back([device newFence]);
+    }
+    id<MTLFence> fence = o.fence_pool[o.fence_next++];
+    const MTLRenderStages stages = MTLRenderStageVertex | MTLRenderStageFragment;
+    [o.render updateFence:fence afterStages:stages];
+    [o.render updateFence:LastRenderFence() afterStages:stages];
+    o.render_fences.push_back(fence);
+}
+template <typename Encoder>
+void FenceNonrenderStart(Owned& o, Encoder encoder) {
+    if (!o.nonrender_seen) {
+        [encoder waitForFence:LastRenderFence()];
+        o.nonrender_seen = true;
+    }
+    if (o.war_pending) {
+        for (id<MTLFence> fence : o.render_fences) {
+            [encoder waitForFence:fence];
+        }
+        o.render_fences.clear();
+        o.fence_next = 0; // every fence in the pool has been waited on: free again
+        o.war_pending = false;
+    }
+}
+template <typename Encoder>
+void FenceNonrenderEnd(Encoder encoder) {
+    [encoder updateFence:NonrenderFence()];
+}
 void DumpRender(Owned& o, MTLRenderPassDescriptor* rp, const char* kind);
 void DumpOpen(Owned& o, const char* kind);
 void DumpClose(Owned& o);
@@ -359,11 +418,17 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
     }
     if (o.compute) {
         DumpClose(o);
+        if (Fenced(o)) {
+            FenceNonrenderEnd(o.compute);
+        }
         [o.compute endEncoding];
         o.compute = nil;
     }
     if (o.blit) {
         DumpClose(o);
+        if (Fenced(o)) {
+            FenceNonrenderEnd(o.blit);
+        }
         [o.blit endEncoding];
         o.blit = nil;
     }
@@ -383,7 +448,11 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
     o.pass_opened = true;
     o.cache = {};
     if (o.render) {
-        UseAddressBuffers(o.render, true);
+        if (Fenced(o)) {
+            FenceRenderStart(o);
+        } else {
+            UseAddressBuffers(o.render, true);
+        }
     }
     return o.render;
 }
@@ -405,6 +474,9 @@ id<MTLComputeCommandEncoder> ComputeEncoder(Owned& o) {
         o.compute = [o.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
     }
     UseAddressBuffers(o.compute, false);
+    if (Fenced(o)) {
+        FenceNonrenderStart(o, o.compute);
+    }
     return o.compute;
 }
 
@@ -426,6 +498,9 @@ id<MTLBlitCommandEncoder> BlitEncoder(Owned& o) {
         o.blit = [o.cmd blitCommandEncoder];
     }
     o.dump_count = 1;
+    if (Fenced(o)) {
+        FenceNonrenderStart(o, o.blit);
+    }
     return o.blit;
 }
 
@@ -1077,14 +1152,23 @@ void EndEncoders(Owned& o) {
         DumpClose(o);
     }
     if (o.render) {
+        if (Fenced(o)) {
+            FenceRenderEnd(o);
+        }
         [o.render endEncoding];
         o.render = nil;
     }
     if (o.compute) {
+        if (Fenced(o)) {
+            FenceNonrenderEnd(o.compute);
+        }
         [o.compute endEncoding];
         o.compute = nil;
     }
     if (o.blit) {
+        if (Fenced(o)) {
+            FenceNonrenderEnd(o.blit);
+        }
         [o.blit endEncoding];
         o.blit = nil;
     }
@@ -1388,8 +1472,12 @@ void DeviceAddressTaken(VkBuffer buffer) {
 void Barrier(Owned& o) {
     // Tracked resources order the encoders; inside a compute encoder dispatches are serial.
     // A blit encoder is ended so the next command sees its writes.
+    o.war_pending = true; // experiment bit 9: the next compute/blit encoder waits for renders
     if (o.blit) {
         DumpClose(o);
+        if (Fenced(o)) {
+            FenceNonrenderEnd(o.blit);
+        }
         [o.blit endEncoding];
         o.blit = nil;
     }
@@ -1535,6 +1623,9 @@ void EndRendering(Owned& o) {
     }
     if (o.render) {
         DumpClose(o);
+        if (Fenced(o)) {
+            FenceRenderEnd(o);
+        }
         [o.render endEncoding];
         o.render = nil;
     }
