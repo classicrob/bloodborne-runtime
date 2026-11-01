@@ -274,7 +274,7 @@ struct Stats {
         // kept: the pass stayed open (experiment MetalBarrierInPass).
         barrier_images{}, barrier_graphics_write{}, barrier_other{}, barrier_kept{},
         clear_encoders{}, blit_image_encoders{}, barrier_images_off_pass{}, barrier_layout_only{},
-        loads_skipped{}; ///< colour loads made DontCare (experiment bit 12) ///< render encoders of image clears and blits
+        loads_skipped{}, clears_by_copy{}; ///< render encoders of image clears and blits
 };
 /// BB_METAL_PASS_STATS=1 (diagnostics, off by default).
 bool PassStats();

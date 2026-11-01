@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <tuple>
@@ -374,62 +375,6 @@ void NoteRenderEncoder(MTLRenderPassDescriptor* rp, bool reopened) {
     }
 }
 
-/// Experiment bit 12: the first draw of a pass that loads its one colour target (no depth or
-/// stencil) is a rect list or a draw of at most six vertices, without blending that writes every channel over a viewport and
-/// scissor covering the whole target, so nothing loaded survives: the pass loads nothing
-/// (DontCare). Full-screen passes like the glare/bloom pyramid. The rect itself is assumed to
-/// cover the viewport (as the game's full-screen rects do); frame dumps prove it.
-void SkipOverwrittenLoad(Owned& o, MTLRenderPassDescriptor* rp) {
-    // A rect list, or a direct draw of at most six vertices in one instance (a full-screen
-    // triangle or quad: the glare pyramid's passes draw these).
-    const bool small_draw = o.graphics && (o.graphics->rect_list || o.first_draw_vertices <= 6);
-    if (!BbToggle::Experiment(1ull << 12) || !small_draw || !o.graphics->render ||
-        o.graphics->tess || o.graphics->geometry || rp.depthAttachment.texture ||
-        rp.stencilAttachment.texture) {
-        return;
-    }
-    MTLRenderPassColorAttachmentDescriptor* c = rp.colorAttachments[0];
-    if (!c.texture || c.loadAction != MTLLoadActionLoad) {
-        return;
-    }
-    for (u32 i = 1; i < 8; ++i) {
-        if (rp.colorAttachments[i].texture) {
-            return;
-        }
-    }
-    const auto& key = o.graphics->render->key;
-    using Mask = VideoCore::Backend::ColorWriteMask;
-    const u32 mask = u32(key.write_masks[0]);
-    const MTLPixelFormat f = c.texture.pixelFormat;
-    const u32 needed = f == MTLPixelFormatRG11B10Float || f == MTLPixelFormatRGB9E5Float
-                           ? u32(Mask::R) | u32(Mask::G) | u32(Mask::B)
-                           : u32(Mask::All);
-    if ((mask & needed) != needed || Vulkan::AttachmentBlendState(key, 0).enable) {
-        return;
-    }
-    const double w = double(std::max<NSUInteger>(1, c.texture.width >> c.level));
-    const double h = double(std::max<NSUInteger>(1, c.texture.height >> c.level));
-    if (o.viewports.empty()) {
-        return;
-    }
-    const VkViewport& v = o.viewports[0];
-    const double vx0 = std::min(v.x, v.x + v.width), vx1 = std::max(v.x, v.x + v.width);
-    const double vy0 = std::min(v.y, v.y + v.height), vy1 = std::max(v.y, v.y + v.height);
-    if (vx0 > 0 || vy0 > 0 || vx1 < w || vy1 < h) {
-        return;
-    }
-    if (!o.scissors.empty()) {
-        const VkRect2D& r = o.scissors[0];
-        if (r.offset.x > 0 || r.offset.y > 0 || r.offset.x + double(r.extent.width) < w ||
-            r.offset.y + double(r.extent.height) < h) {
-                return;
-        }
-    }
-    c.loadAction = MTLLoadActionDontCare;
-    if (PassStats()) {
-        ++stats.loads_skipped;
-    }
-}
 
 /// The render encoder of the current pass, opened on first use: a pass without draws costs
 /// nothing unless it clears (EndRendering), and work before its first draw (tessellation
@@ -449,9 +394,6 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
         FenceNonrenderEnd(o.blit);
         [o.blit endEncoding];
         o.blit = nil;
-    }
-    if (!o.pass_opened) {
-        SkipOverwrittenLoad(o, o.pass_first);
     }
     if (PassStats()) {
         NoteRenderEncoder(o.pass_opened ? o.pass : o.pass_first, o.pass_opened);
@@ -2467,10 +2409,67 @@ void ForEachSubresource(id<MTLTexture> texture, u32 count, const VkImageSubresou
 }
 } // namespace
 
+namespace {
+/// Experiment bit 12 (reused; the DontCare-load experiment was dropped): RGBA8/BGRA8 colour
+/// clears as blit copies from a buffer holding the clear value, not as empty render passes. In
+/// Iosefka's Clinic one 960x540 RGBA8 clear pass a frame lasts 2.2-2.9 ms on the GPU for
+/// 0.016 ms of stage work (Measurement); this tests whether the render-pass clear is the slow
+/// part.
+bool ClearByCopy(Owned& o, id<MTLTexture> texture, const VkClearColorValue* color, u32 count,
+                 const VkImageSubresourceRange* ranges) {
+    const MTLPixelFormat f = texture.pixelFormat;
+    if ((f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatBGRA8Unorm) ||
+        texture.textureType != MTLTextureType2D || texture.sampleCount != 1) {
+        return false;
+    }
+    const auto unorm = [](float v) { return u8(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f)); };
+    const float* c = color->float32;
+    const u8 r = unorm(c[0]), g = unorm(c[1]), b = unorm(c[2]), a = unorm(c[3]);
+    const u32 pixel = f == MTLPixelFormatRGBA8Unorm ? u32(r) | u32(g) << 8 | u32(b) << 16 | u32(a) << 24
+                                                    : u32(b) | u32(g) << 8 | u32(r) << 16 | u32(a) << 24;
+    const NSUInteger w = texture.width, h = texture.height;
+    const NSUInteger bytes = w * h * 4;
+    // One buffer per (size, value), kept: the game clears the same targets to the same values.
+    static std::mutex mutex;
+    static std::map<std::pair<NSUInteger, u32>, id<MTLBuffer>> patterns;
+    id<MTLBuffer> pattern;
+    {
+        std::scoped_lock lock{mutex};
+        auto& slot = patterns[{bytes, pixel}];
+        if (!slot) {
+            slot = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+            std::fill_n(static_cast<u32*>(slot.contents), w * h, pixel);
+        }
+        pattern = slot;
+    }
+    id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
+    DumpWrite(o, texture);
+    ForEachSubresource(texture, count, ranges, [&](u32, u32 level, u32 layer) {
+        const NSUInteger lw = std::max<NSUInteger>(1, w >> level), lh = std::max<NSUInteger>(1, h >> level);
+        [blit copyFromBuffer:pattern
+                   sourceOffset:0
+              sourceBytesPerRow:lw * 4
+            sourceBytesPerImage:lw * lh * 4
+                     sourceSize:MTLSizeMake(lw, lh, 1)
+                      toTexture:texture
+               destinationSlice:layer
+               destinationLevel:level
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+    });
+    if (PassStats()) {
+        ++stats.clears_by_copy;
+    }
+    return true;
+}
+} // namespace
+
 void ClearColorImage(Owned& o, VkImage image, const VkClearColorValue* color, u32 count,
                      const VkImageSubresourceRange* ranges) {
     id<MTLTexture> texture = TextureOfImage(image);
     if (!texture) {
+        return;
+    }
+    if (BbToggle::Experiment(1ull << 12) && ClearByCopy(o, texture, color, count, ranges)) {
         return;
     }
     EndEncoders(o);
