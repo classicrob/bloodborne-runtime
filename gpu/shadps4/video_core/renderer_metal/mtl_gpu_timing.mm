@@ -50,7 +50,7 @@ bool split = false;    ///< BB_METAL_GPU_TIMING=2: vertex and fragment stage end
 unsigned every = 1;    ///< BB_METAL_GPU_TIMING_EVERY: one frame in this many sampled
 FILE* gap_file = nullptr; ///< BB_METAL_GPU_TIMING_GAPS=<file>: every gap over 200 us, with times
 unsigned seq_from = 0, seq_to = 0; ///< BB_METAL_GPU_TIMING_SEQ=from-to: these positions in order
-std::string seq_anchor; ///< BB_METAL_GPU_TIMING_SEQ=<text>:<count>[:<before>]: around the first encoder named so
+std::string seq_anchor; ///< BB_METAL_GPU_TIMING_SEQ=[!]<text>:<count>[:<before>]: around the first (! the longest) encoder named so
 long seq_before = 0;
 id<MTLDevice> device;
 id<MTLCounterSet> timestamps;
@@ -583,11 +583,23 @@ void Report() {
         };
         long anchor = 0;
         if (!seq_anchor.empty()) {
+            // "!text": the matching encoder with the longest span in the frame, else the first.
+            const bool longest = seq_anchor[0] == '!';
+            const std::string text = longest ? seq_anchor.substr(1) : seq_anchor;
             anchor = -1;
+            double best = -1;
             for (size_t i = 0; i < list.size(); ++i) {
-                if (label_of(list[i]->encoder).find(seq_anchor) != std::string::npos) {
+                if (label_of(list[i]->encoder).find(text) == std::string::npos) {
+                    continue;
+                }
+                const double len = list[i]->end - list[i]->start;
+                if (!longest) {
                     anchor = long(i);
                     break;
+                }
+                if (len > best) {
+                    best = len;
+                    anchor = long(i);
                 }
             }
         }
