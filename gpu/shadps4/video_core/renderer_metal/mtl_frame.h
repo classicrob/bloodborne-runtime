@@ -263,7 +263,7 @@ struct Stats {
         // Barriers flushed in an open pass (Vulkan::Runtime::FlushBarriers), by what they wait for;
         // kept: the pass stayed open (experiment MetalBarrierInPass).
         barrier_images{}, barrier_graphics_write{}, barrier_other{}, barrier_kept{},
-        clear_encoders{}, blit_image_encoders{}, barrier_images_off_pass{}; ///< render encoders of image clears and blits
+        clear_encoders{}, blit_image_encoders{}, barrier_images_off_pass{}, barrier_layout_only{}; ///< render encoders of image clears and blits
 };
 /// BB_METAL_PASS_STATS=1 (diagnostics, off by default).
 bool PassStats();

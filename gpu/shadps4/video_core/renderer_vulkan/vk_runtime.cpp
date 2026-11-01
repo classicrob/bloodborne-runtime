@@ -1412,6 +1412,7 @@ void Runtime::FlushBarriers() {
     // the open pass renders into (layouts mean nothing to Metal; sampling one of its attachments
     // needs the pass stored first).
     bool on_attachments = false;
+    u32 attachment_layout_only = 0;
     if (in_pass && !image_barriers.empty()) {
         const RenderState& state = scheduler.GetRenderState();
         std::array<VkImage, 9> images{};
@@ -1422,11 +1423,23 @@ void Runtime::FlushBarriers() {
         if (state.depth_stencil_attachment.image_view) {
             images[n++] = VkImage(MetalLayer::ImageOfView(state.depth_stencil_attachment.image_view));
         }
+        // Experiment bit 9: a barrier on one of its attachments that keeps it an attachment
+        // (only attachment accesses after it: a layout change, which Metal does not have) does
+        // not count either. Sampling an attachment still ends the pass.
+        constexpr auto attachment_only =
+            vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite |
+            vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+        const bool stays_attachment_ok = BbToggle::Experiment(1ull << 9);
         for (const auto& barrier : image_barriers) {
             const VkImage image = static_cast<VkImage>(barrier.image);
+            const bool stays_attachment =
+                barrier.dstAccessMask && !(barrier.dstAccessMask & ~attachment_only);
             for (u32 i = 0; i < n; ++i) {
                 // An attachment whose image is not known counts as this image.
-                on_attachments |= !images[i] || images[i] == image;
+                const bool on = !images[i] || images[i] == image;
+                on_attachments |= on && !(stays_attachment && images[i] && stays_attachment_ok);
+                attachment_layout_only += on && stays_attachment && images[i];
             }
         }
     }
@@ -1439,6 +1452,9 @@ void Runtime::FlushBarriers() {
                                       : on_attachments       ? 0
                                                              : 3,
                                       keep_pass);
+        if (attachment_layout_only) {
+            MetalLayer::NoteBarrierInPass(4, false);
+        }
     }
 #else
     const bool keep_pass = false;

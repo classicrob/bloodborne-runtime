@@ -4953,6 +4953,13 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         .dst_offset = dst_offset,
         .size = num_bytes,
     };
+    // bbport (experiment bit 8, DmaCopiesBeforePass): a DMA copy inside a render pass whose draws
+    // did not touch its ranges runs before the pass instead of splitting it, as the copy
+    // shader's copies do (BB_HOIST_COPIES).
+    if (BbToggle::Experiment(1ull << 8) &&
+        runtime.CopyBufferBeforePass(src_buffer, dst_buffer, std::span{&copy, 1})) {
+        return;
+    }
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
 }
 

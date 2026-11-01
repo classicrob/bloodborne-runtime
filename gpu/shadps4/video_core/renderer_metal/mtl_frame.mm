@@ -228,10 +228,14 @@ void UseAddressBuffers(id<MTLCommandEncoder> encoder, bool render) {
                    usage:writes ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead
                   stages:MTLRenderStageVertex | MTLRenderStageFragment];
     } else {
-        [(id<MTLComputeCommandEncoder>)encoder useResources:resources.data()
-                                                      count:resources.size()
-                                                      usage:MTLResourceUsageRead |
-                                                            MTLResourceUsageWrite];
+        // Experiment bit 11 (PROBE ONLY, unsafe: drops real ordering): compute encoders declare
+        // the guest memory read-only, so Metal no longer serializes them against the render
+        // encoders around them. Measures how much of the idle between encoders this ordering is.
+        const bool probe = BbToggle::Experiment(1ull << 11);
+        [(id<MTLComputeCommandEncoder>)encoder
+            useResources:resources.data()
+                   count:resources.size()
+                   usage:probe ? MTLResourceUsageRead : MTLResourceUsageRead | MTLResourceUsageWrite];
     }
 }
 

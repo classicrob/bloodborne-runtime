@@ -208,9 +208,11 @@ void Report() {
             }
             std::printf("Metal passes per frame: barriers in an open pass: %.1f with image barriers "
                         "on its attachments, %.1f with image barriers on other images only, %.1f "
-                        "after graphics-stage writes, %.1f other; %.1f kept the pass open\n",
+                        "after graphics-stage writes, %.1f other; %.1f kept the pass open; %.1f "
+                        "with barriers on its attachments that keep them attachments\n",
                         x(s.barrier_images), x(s.barrier_images_off_pass),
-                        x(s.barrier_graphics_write), x(s.barrier_other), x(s.barrier_kept));
+                        x(s.barrier_graphics_write), x(s.barrier_other), x(s.barrier_kept),
+                        x(s.barrier_layout_only));
             std::printf("Metal passes per frame: attachments loaded %.1f MB (%.1f MB by reopened "
                         "passes), stored %.1f MB\n",
                         x(s.load_bytes) / 1e6, x(s.reopen_load_bytes) / 1e6,
@@ -1224,6 +1226,10 @@ unsigned long long ImageOfView(unsigned long long view) {
 
 void NoteBarrierInPass(int kind, bool kept) {
     auto& s = MetalFrame::GetStats();
+    if (kind == 4) {
+        ++s.barrier_layout_only;
+        return;
+    }
     ++(kind == 0   ? s.barrier_images
        : kind == 3 ? s.barrier_images_off_pass
        : kind == 1 ? s.barrier_graphics_write
