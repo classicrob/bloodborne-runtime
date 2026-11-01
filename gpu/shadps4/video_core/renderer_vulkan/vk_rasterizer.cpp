@@ -1827,10 +1827,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             std::scoped_lock lock{mutex};
             const u64 count = ++seen[id];
             if (count == 1 || count % 4096 == 0) {
-                std::printf("Small pass: ps %016llx vs %016llx %ux%u (scissor %ux%u) format %u "
-                            "prim %u indices %u, %llu draws\n",
+                // The programs' own hashes name their MSL in the Metal shader cache.
+                const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+                const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+                std::printf("Small pass: ps %016llx vs %016llx (programs %016llx %016llx) %ux%u "
+                            "(scissor %ux%u) format %u prim %u indices %u, %llu draws\n",
                             (unsigned long long)key.stage_hashes[0],
-                            (unsigned long long)key.stage_hashes[3], width, height,
+                            (unsigned long long)key.stage_hashes[3],
+                            (unsigned long long)(ps ? ps->pgm_hash : 0),
+                            (unsigned long long)(vs ? vs->pgm_hash : 0), width, height,
                             regs.screen_scissor.GetWidth(), regs.screen_scissor.GetHeight(), format,
                             u32(regs.primitive_type), regs.num_indices,
                             (unsigned long long)count);
