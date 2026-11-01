@@ -47,6 +47,7 @@ struct Record {
 bool enabled = false;
 bool split = false;    ///< BB_METAL_GPU_TIMING=2: vertex and fragment stage ends sampled too
 unsigned every = 1;    ///< BB_METAL_GPU_TIMING_EVERY: one frame in this many sampled
+unsigned seq_from = 0, seq_to = 0; ///< BB_METAL_GPU_TIMING_SEQ=from-to: these positions in order
 id<MTLDevice> device;
 id<MTLCounterSet> timestamps;
 std::mutex pool_mutex;
@@ -220,6 +221,9 @@ void Init(id<MTLDevice> dev) {
     Calibrate(gpu0, steady0);
     last_report = steady0;
     split = env[0] == '2';
+    if (const char* q = std::getenv("BB_METAL_GPU_TIMING_SEQ")) {
+        std::sscanf(q, "%u-%u", &seq_from, &seq_to);
+    }
     if (const char* n = std::getenv("BB_METAL_GPU_TIMING_EVERY")) {
         every = std::max(1, std::atoi(n));
     }
@@ -509,6 +513,11 @@ void Report() {
     std::map<std::string, Sum> gaps; // idle between encoders, by the kinds on either side
     std::map<std::string, Sum> by_shader, by_kernel; // render passes by first vertex function, compute by first kernel
     std::map<std::string, Sum> gap_pairs; // idle by the two encoders on either side and what separates them
+    struct Step {
+        double exclusive{}, span{}, gap{}, count{}, work{};
+        std::string label;
+    };
+    std::map<unsigned, Step> sequence; // BB_METAL_GPU_TIMING_SEQ
     double span = 0, busy = 0, idle = 0, between = 0, gap_count = 0, sum_all = 0;
     double prev_end = -1;
     for (auto& [frame, list] : frames) {
@@ -563,6 +572,16 @@ void Report() {
                 t.exclusive += exclusive[r];
                 t.encoders += 1;
                 t.work += e.work;
+            }
+            if (seq_to && position >= seq_from && position <= seq_to) {
+                Step& st = sequence[position];
+                st.exclusive += exclusive[r];
+                st.span += ms;
+                st.gap += r->start > reach ? (r->start - reach) / 1e6 : 0.0;
+                st.count += 1;
+                st.work += e.work;
+                st.label = (e.kind == 'R' ? "R " + e.signature : e.kind == 'C' ? "C " + e.shader : std::string("blit")) +
+                           (e.kind == 'R' && !e.shader.empty() ? " vs " + e.shader : std::string());
             }
             ++position;
             sum_all += ms;
@@ -628,6 +647,15 @@ void Report() {
         positions["#" + std::to_string(k.first) + " " + k.second] = v;
     }
     print("costliest encoders by position in the frame (GPU order)", positions, 20);
+    if (!sequence.empty()) {
+        std::printf("  positions %u-%u in GPU order (ms per occurrence: exclusive, span, idle before; "
+                    "share of frames, draws):\n", seq_from, seq_to);
+        for (const auto& [pos, st] : sequence) {
+            std::printf("    #%-4u %6.3f %6.3f %6.3f %5.2f %5.1f  %s\n", pos, st.exclusive / st.count,
+                        st.span / st.count, st.gap / st.count, st.count / n, st.work / st.count,
+                        st.label.c_str());
+        }
+    }
     print("render passes by their first draw's vertex function", by_shader, 20);
     print("compute encoders by their first kernel", by_kernel, 15);
     std::printf("  idle between encoders by the kinds on either side (ms/frame, gaps/frame):\n");
