@@ -2185,15 +2185,18 @@ bool CopyComputeStats() {
 static bool BufferAsCompute(Owned& o, id<MTLBuffer> src, u64 src_base,
                             id<MTLBuffer> dst, u64 dst_base, u32 count,
                             const VkBufferCopy* regions, u8 fill) {
-    if (!BbToggle::Experiment(1ull << 10) || !o.compute || o.render ||
+    // Experiment bit 14 (reused; larger transfers were dropped): with no encoder open, a small
+    // transfer opens a compute encoder instead of a blit one, so the next transfers after a
+    // barrier (which ends blit encoders, not compute ones) join it: no blit -> blit gaps.
+    const bool open_compute = !o.compute && !o.blit && !o.render &&
+                              BbToggle::Experiment(1ull << 14);
+    if (!BbToggle::Experiment(1ull << 10) || (!o.compute && !open_compute) || o.render ||
         !o.pending.empty() || !count) return false;
     static const u64 env_limit = []() -> u64 {
         const char* e = std::getenv("BB_COPY_COMPUTE_MAX");
         return e ? std::min<u64>(std::strtoull(e, nullptr, 0), 1ull << 30) : 65536;
     }();
-    // Experiment bit 14: transfers up to 8 MiB too (the blits right after compute kernels).
-    const u64 limit = BbToggle::Experiment(1ull << 14) ? std::max<u64>(env_limit, 8ull << 20)
-                                                       : env_limit;
+    const u64 limit = env_limit;
     u64 total = 0;
     for (u32 i = 0; i < count; ++i) {
         if (regions[i].size > limit - total) return false;
@@ -2262,6 +2265,9 @@ kernel void buffer_vectors(device const uchar* src [[buffer(0)]],
         if (!pipeline) std::printf("Metal buffer kernel: %s\n", error.localizedDescription.UTF8String);
     });
     if (!pipeline) return false;
+    if (!o.compute) {
+        ComputeEncoder(o);
+    }
     if (src) [o.compute useResource:src usage:MTLResourceUsageRead];
     [o.compute useResource:dst usage:src == dst ? MTLResourceUsageRead | MTLResourceUsageWrite
                                                : MTLResourceUsageWrite];
