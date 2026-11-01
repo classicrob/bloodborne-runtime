@@ -2354,6 +2354,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 static_cast<u32>(opcode), count);
             }
             dcb = NextPacket(dcb, header->type3.NumWords() + 1);
+            if (rasterizer) {
+                // bbport (experiment bit 15): commit what is recorded when the GPU has run dry.
+                const bool work = opcode == PM4ItOpcode::DrawIndex2 ||
+                                  opcode == PM4ItOpcode::DrawIndexIndirectCountMulti ||
+                                  opcode == PM4ItOpcode::DrawIndexOffset2 ||
+                                  opcode == PM4ItOpcode::DrawIndexAuto ||
+                                  opcode == PM4ItOpcode::DrawIndirect ||
+                                  opcode == PM4ItOpcode::DrawIndirectMulti ||
+                                  opcode == PM4ItOpcode::DrawIndexIndirect ||
+                                  opcode == PM4ItOpcode::DrawIndexIndirectMulti ||
+                                  opcode == PM4ItOpcode::DispatchDirect ||
+                                  opcode == PM4ItOpcode::DispatchIndirect ||
+                                  opcode == PM4ItOpcode::DmaData;
+                rasterizer->NoteDecodedPacket(work);
+            }
             break;
         }
     }
