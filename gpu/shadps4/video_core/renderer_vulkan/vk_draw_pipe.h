@@ -125,7 +125,7 @@ public:
         const u64 start = __rdtsc();
         u32 spins = 0;
         for (; consumed.load(std::memory_order_acquire) != head; ++spins) {
-            if (spins < 4096) {
+            if (spins < 4096 || !DrainYields()) {
                 __builtin_ia32_pause();
             } else {
                 std::this_thread::yield();
@@ -153,7 +153,7 @@ public:
         const u64 start = __rdtsc();
         u32 spins = 0;
         for (; !ReachedPacket(number); ++spins) {
-            if (spins < 4096) {
+            if (spins < 4096 || !DrainYields()) {
                 __builtin_ia32_pause();
             } else {
                 std::this_thread::yield();
@@ -196,6 +196,17 @@ private:
 
     static constexpr u32 Align(u32 size) {
         return (size + 63) & ~63u;
+    }
+
+    /// Whether stage A's drain waits yield after 4096 pauses. BB_PIPE_DRAIN_YIELD=0 (a test): pause
+    /// only. On macOS a yield (swtch_pri) depresses the thread's priority, and stage A then resumed
+    /// up to ~3 ms after stage B finished in the CY walk's slow frames.
+    static bool DrainYields() {
+        static const bool yields = [] {
+            const char* env = std::getenv("BB_PIPE_DRAIN_YIELD");
+            return !(env && env[0] == '0');
+        }();
+        return yields;
     }
 
     /// Stage A, after a drain wait for packet `number`: the statistics, and for BB_FRAME_LOG the
