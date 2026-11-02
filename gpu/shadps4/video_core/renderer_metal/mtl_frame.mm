@@ -913,6 +913,7 @@ void CommitChunk(Owned& o) {
     [o.cmd commit];
     o.cmd = [queue commandBufferWithUnretainedReferences];
     o.cmd.label = @"bbport Metal path";
+    o.nonrender_seen = false; // the new command buffer's first compute/blit encoder waits again
     o.scratch = nil; // its chunk now belongs to the committed command buffer
     o.scratch_used = 0;
     o.chunk_draws = 0;
@@ -1180,6 +1181,14 @@ void Barrier(Owned& o) {
     o.war_pending = true; // fenced ordering: the next compute/blit encoder waits for renders
     // Tracked resources order the encoders; inside a compute encoder dispatches are serial.
     // A blit encoder is ended so the next command sees its writes.
+    // Fenced ordering: an open compute encoder that did not wait for the render encoders ended
+    // since it began (render_fences) is ended too, so a dispatch after this barrier, in the next
+    // encoder, waits for them (write after read on what those draws read).
+    if (Fenced() && o.compute && !o.render_fences.empty()) {
+        FenceNonrenderEnd(o.compute);
+        [o.compute endEncoding];
+        o.compute = nil;
+    }
     if (o.blit) {
         if (Fenced()) {
             FenceNonrenderEnd(o.blit);
