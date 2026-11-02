@@ -122,7 +122,9 @@ public:
     /// bbport (stage A, BB_CONSTRAM_PIPE, default on): before the command processor writes guest
     /// memory with the CPU (a constant RAM dump), waits until the recording thread has run the
     /// queued packets that read those bytes (their buffer bindings, DMA), not all of them.
-    void WaitForPendingReads(VAddr address, u64 size);
+    void WaitForPendingReads(VAddr address, u64 size, u32 reason = DrawPipe::ReasonConstRam);
+    /// bbport (experiment bit 24): does a cached image overlap the range (locked).
+    [[nodiscard]] bool ImageOverlaps(VAddr address, u64 size);
     /// NoteCommandWrite for a write made on stage A: handed to the recording thread in order (a copy
     /// of the bytes) instead of draining it first.
     void NoteCommandWriteInOrder(VAddr addr, const void* data, u64 size);
@@ -211,6 +213,9 @@ public:
     /// recorded before it). Values of up to 8 bytes are registered for WAIT_REG_MEM until the GPU
     /// has written them. False: not in place (or BB_GPU_COMMAND_WRITES=0), the caller stores it.
     bool WriteDataOnGpu(VAddr address, const void* data, u32 size);
+    /// bbport (experiment bit 24, stage A while the recording thread runs): false when
+    /// WriteDataOnGpu certainly stores with the CPU (records nothing for the GPU).
+    [[nodiscard]] bool WriteDataMayUseGpu(VAddr address, u32 size) const;
     /// bbport BB_GUEST_IN_PLACE (in stream order: the recording thread): an end-of-pipe label
     /// (EVENT_WRITE_EOP/EOS) written by the GPU itself once the work recorded before it is done,
     /// as the command processor does: a buffer marker into the game's memory, where the CPU sees

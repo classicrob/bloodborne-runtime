@@ -362,12 +362,21 @@ bool Rasterizer::WriteGuestMemory(VAddr address, const void* data, u32 size) {
     return true;
 }
 
-bool Rasterizer::WriteDataOnGpu(VAddr address, const void* data, u32 size) {
+static bool GpuCommandWrites() {
     static const bool enabled = [] {
         const char* env = std::getenv("BB_GPU_COMMAND_WRITES");
         return !env || env[0] != '0';
     }();
-    if (!enabled || !VideoCore::GuestInPlace() || size == 0 || (address | size) % 4 != 0) {
+    return enabled;
+}
+
+bool Rasterizer::WriteDataMayUseGpu(VAddr address, u32 size) const {
+    return GpuCommandWrites() && VideoCore::GuestInPlace() && size != 0 &&
+           (address | size) % 4 == 0 && buffer_cache.CommandWriteTargetPossible(address, size);
+}
+
+bool Rasterizer::WriteDataOnGpu(VAddr address, const void* data, u32 size) {
+    if (!GpuCommandWrites() || !VideoCore::GuestInPlace() || size == 0 || (address | size) % 4 != 0) {
         return false;
     }
     // bbport BB_LAYER_MEMORY: a range whole in a mirror is written there too (asked first: the
@@ -381,6 +390,10 @@ bool Rasterizer::WriteDataOnGpu(VAddr address, const void* data, u32 size) {
         runtime.UpdateBuffer(mirror->first, mirror->second, {static_cast<const u8*>(data), size});
     }
     runtime.UpdateBuffer(target->first, target->second, {static_cast<const u8*>(data), size});
+    static std::atomic<bool> reported{false};
+    if (BbToggle::Experiment(1ull << 24) && !reported.exchange(true, std::memory_order_relaxed)) {
+        std::printf("GPU: a WRITE_DATA written on the GPU, in place (experiment bit 24: drained)\n");
+    }
     if (size <= sizeof(u64) && HonestLabels()) {
         u64 value = 0;
         std::memcpy(&value, data, size);
@@ -1315,7 +1328,11 @@ void Rasterizer::NotePendingRead(VAddr address, u64 size) {
     }
 }
 
-void Rasterizer::WaitForPendingReads(VAddr address, u64 size) {
+bool Rasterizer::ImageOverlaps(VAddr address, u64 size) {
+    return texture_cache.HasImageInRange(address, size);
+}
+
+void Rasterizer::WaitForPendingReads(VAddr address, u64 size, u32 reason) {
     static const bool enabled = [] {
         const char* env = std::getenv("BB_CONSTRAM_PIPE");
         return !env || env[0] != '0';
@@ -1324,7 +1341,7 @@ void Rasterizer::WaitForPendingReads(VAddr address, u64 size) {
         return;
     }
     if (!enabled || !UseDrawPipe() || size == 0) {
-        DrainDrawPipe(DrawPipe::ReasonConstRam);
+        DrainDrawPipe(reason);
         return;
     }
     const u64 packet = std::max(untracked_reads_packet, pending_reads.Newest(address, size));
@@ -1332,7 +1349,7 @@ void Rasterizer::WaitForPendingReads(VAddr address, u64 size) {
         ++constram_waits_skipped;
         return;
     }
-    draw_pipe->WaitForPacket(packet, DrawPipe::ReasonConstRam);
+    draw_pipe->WaitForPacket(packet, reason);
 }
 
 void Rasterizer::NoteCommandWriteInOrder(VAddr addr, const void* data, u64 size) {

@@ -149,6 +149,10 @@ public:
     /// with the game's memory (the range keeps its VRAM copy); empty: none, it goes in place.
     [[nodiscard]] std::optional<std::pair<const Buffer*, u64>> CommandWriteMirror(VAddr device_addr,
                                                                                 u32 size);
+    /// bbport (experiment bit 24): false when CommandWriteTarget certainly finds no target for the
+    /// range, decided without its side effects and without the caches the recording thread owns
+    /// while it has packets (any thread may ask). True: it may (and always with BB_LAYER_MEMORY).
+    [[nodiscard]] bool CommandWriteTargetPossible(VAddr device_addr, u32 size) const;
 
     /// Return true when a region is modified from the CPU
     [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
@@ -571,6 +575,8 @@ private:
     TrackedIntervalList<Backing> resident_ranges;
     /// bbport BB_GUEST_IN_PLACE: blocks bound to the game's own memory, and guest unmaps to apply.
     TrackedIntervalList<> in_place_blocks;
+    /// Set before the first block is added to in_place_blocks (CommandWriteTargetPossible).
+    std::atomic<bool> any_in_place{false};
     std::mutex pending_unmaps_mutex;
     std::vector<std::pair<VAddr, u64>> pending_unmaps;
     std::atomic<bool> unmaps_pending{false};

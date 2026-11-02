@@ -653,6 +653,24 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
                                 (header->type3.count.Value() - 2) * sizeof(u32), true);
 }
 
+// bbport (experiment bit 24, MEASUREMENT-ONLY probe): RunWriteData on stage A while the recording
+// thread still has packets, to size what the drain costs. The caller waited for the queued packets
+// that read the range and checked that no host copy reads it and that it is not written on the
+// GPU. Unlike RunWriteData it does not write the fences deferred earlier first: the game may see
+// this value before an earlier end-of-pipe label (as on the hardware, where the command
+// processor's write does not wait for the pipe, but not what RunWriteData guarantees). The caches
+// learn of the write in order, on the recording thread (NoteCommandWriteInOrder). Assumes no queued
+// packet not yet listed binds the range in place in between (round 3: 0 writes into bound buffers).
+void RunWriteDataRelaxed(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    const auto* header = reinterpret_cast<const PM4Header*>(data);
+    const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(data);
+    const u32 size = (header->type3.count.Value() - 2) * sizeof(u32);
+    BbFreeCheck::Check(write_data->Address<u64>(), size, write_data->data, BbFreeCheck::WriteData);
+    BbWriteLog::Note(write_data->Address<u64>(), write_data->data, size, BbWriteLog::WriteData);
+    std::memcpy(write_data->Address<u64*>(), write_data->data, size);
+    rasterizer.NoteCommandWriteInOrder(write_data->Address<VAddr>(), write_data->data, size);
+}
+
 void WriteEosLabel(void* address, u64 value, u32 num_bytes) {
     auto* memory = Core::Memory::Instance();
     BbFreeCheck::Check(reinterpret_cast<u64>(address), num_bytes, &value, BbFreeCheck::Eos);
@@ -2078,8 +2096,26 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                         (count + 1) * sizeof(u32),
                                                         BbToggle::PipelinedMemoryWrites, false);
                     } else {
-                        rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
-                        RunWriteData(*rasterizer, reinterpret_cast<const u8*>(header));
+                        // bbport (experiment bit 24, MEASUREMENT-ONLY probe, never default):
+                        // the store without draining the pipe. Not proven safe: see
+                        // RunWriteDataRelaxed. Drained as before over a cached image, where the
+                        // write may be made on the GPU, or where a host copy may still read it.
+                        const VAddr wd_address = write_data->Address<VAddr>();
+                        const u32 wd_bytes = (count - 2) * sizeof(u32);
+                        bool relaxed = false;
+                        if (BbToggle::Experiment(1ull << 24) &&
+                            !rasterizer->WriteDataMayUseGpu(wd_address, wd_bytes) &&
+                            !rasterizer->ImageOverlaps(wd_address, wd_bytes)) {
+                            rasterizer->WaitForPendingReads(wd_address, wd_bytes,
+                                                            static_cast<u32>(opcode));
+                            relaxed = !rasterizer->HostCopiesPendingFor(wd_address, wd_bytes);
+                        }
+                        if (relaxed) {
+                            RunWriteDataRelaxed(*rasterizer, reinterpret_cast<const u8*>(header));
+                        } else {
+                            rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+                            RunWriteData(*rasterizer, reinterpret_cast<const u8*>(header));
+                        }
                     }
                     if (queued) {
                         NotePendingWrite(*write_data, (count - 2) * sizeof(u32));
