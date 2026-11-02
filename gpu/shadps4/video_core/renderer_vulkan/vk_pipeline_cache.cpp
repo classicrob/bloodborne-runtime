@@ -788,6 +788,13 @@ static std::optional<VideoCore::Backend::Format> VertexFormat(const PipelineSele
     if (format == VideoCore::Backend::Format::Undefined &&
         buffer.GetDataFmt() != AmdGpu::DataFormat::FormatInvalid) {
         sel.worker->failed = true;
+        static std::atomic<u32> count{0};
+        const u32 n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n & 1023) == 0) {
+            std::printf("Draw preparation: vertex format data %u number %u unknown (a stale V#?): "
+                        "the draw left to the GPU thread (%u so far)\n",
+                        u32(buffer.GetDataFmt()), u32(buffer.GetNumberFmt()), n);
+        }
         return std::nullopt;
     }
     return format;
@@ -810,6 +817,12 @@ static bool PreparedVertexFormatsMatch(const GraphicsPipeline& pipeline,
         const auto buffer = fetch->attributes[i].GetSharp(vs);
         if (LiverpoolToVK::TrySurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()) !=
             key.vertex_buffer_formats[i]) {
+            static std::atomic<u32> count{0};
+            const u32 n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n & 1023) == 0) {
+                std::printf("Draw preparation: a prepared key's vertex format changed before its "
+                            "draw: selected again (%u so far)\n", n);
+            }
             return false;
         }
     }
