@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "bbport_stale_desc.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -55,7 +56,10 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     if (is_storage && nfmt == AmdGpu::NumberFormat::Srgb) {
         nfmt = AmdGpu::NumberFormat::Unorm;
     }
-    format = Vulkan::LiverpoolToVK::SurfaceFormat(dfmt, nfmt);
+    {
+        const BbStaleDesc::Scope scope{"texture T# (view)", &image, sizeof(image), image.Address()};
+        format = Vulkan::LiverpoolToVK::SurfaceFormat(dfmt, nfmt);
+    }
     if (desc.is_depth) {
         format = Vulkan::LiverpoolToVK::PromoteFormatToDepth(format);
     }
@@ -76,6 +80,8 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::ColorBuffer& col_buffer) noexcept {
     range.base.layer = col_buffer.BaseSlice();
     range.extent.layers = col_buffer.NumSlices() - range.base.layer;
     type = range.extent.layers > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
+    const BbStaleDesc::Scope scope{"color buffer (view)", &col_buffer, sizeof(col_buffer),
+                                   col_buffer.Address()};
     format =
         Vulkan::LiverpoolToVK::SurfaceFormat(col_buffer.GetDataFmt(), col_buffer.GetNumberFmt());
 }
