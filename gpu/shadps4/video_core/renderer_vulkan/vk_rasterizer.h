@@ -190,6 +190,9 @@ public:
     /// address+size) has been recorded (a write there could skip the draw pipe drain), 1 when a
     /// tracked read of the range is still queued, 2 when only an untracked read is.
     [[nodiscard]] u32 PendingReadState(VAddr address, u64 size) const;
+    /// bbport BB_WRITEDATA_STATS: 1 a cached image overlaps the range, 2 a buffer bound in the
+    /// last two frames does, 0 neither (plain memory).
+    [[nodiscard]] u32 WriteTargetClass(VAddr address, u64 size);
     /// Before a guest-visible write: fences deferred earlier are written first.
     void WaitDeferredSignals() {
         recorder.WaitDeferredSignals();

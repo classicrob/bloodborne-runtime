@@ -1169,6 +1169,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         Shader::NoteStaleRangeAccess(is_written ? "buffer bind (written)" : "buffer bind (read)",
                                      device_addr, size);
     }
+    static const bool wd_stats = std::getenv("BB_WRITEDATA_STATS") != nullptr;
+    if (wd_stats) [[unlikely]] {
+        NoteRecentBind(device_addr, size);
+    }
     const bool stats = BufferStatsEnabled();
     if (stats) {
         PrintBufferStats();
@@ -3398,6 +3402,32 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<Backend::
 thread_local std::array<u64, 2> tile_back_programs{};
 void SetTileBackPrograms(u64 first, u64 second) {
     tile_back_programs = {first, second};
+}
+
+namespace {
+std::array<std::atomic<u64>, 1u << 16> recent_bind_pages{}; // (page << 20) | (frame & 0xFFFFF)
+}
+
+void NoteRecentBind(VAddr address, u64 size) {
+    const u64 frame = BbStats::frame_number.load(std::memory_order_relaxed) & 0xFFFFF;
+    const u64 last = (address + std::max<u64>(size, 1) - 1) >> 12;
+    for (u64 page = address >> 12; page <= last && page - (address >> 12) < 4096; ++page) {
+        recent_bind_pages[(page * 0x9E3779B97F4A7C15ull) >> 48].store(
+            (page << 20) | frame, std::memory_order_relaxed);
+    }
+}
+
+bool WasRecentlyBound(VAddr address, u64 size, u32 frames) {
+    const u64 now = BbStats::frame_number.load(std::memory_order_relaxed) & 0xFFFFF;
+    const u64 last = (address + std::max<u64>(size, 1) - 1) >> 12;
+    for (u64 page = address >> 12; page <= last; ++page) {
+        const u64 v = recent_bind_pages[(page * 0x9E3779B97F4A7C15ull) >> 48].load(
+            std::memory_order_relaxed);
+        if ((v >> 20) == page && ((now - (v & 0xFFFFF)) & 0xFFFFF) <= frames) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, u64 arena_offset,

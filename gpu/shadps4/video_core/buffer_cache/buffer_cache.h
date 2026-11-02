@@ -68,6 +68,11 @@ public:
 /// bbport (BB_TILE_BACK_LOG): the programs being bound on this thread (buffer_cache.cpp).
 void SetTileBackPrograms(u64 first, u64 second);
 
+/// bbport BB_WRITEDATA_STATS (diagnostics): 4 KiB pages bound by ObtainBuffer, stamped with the frame
+/// (a lossy table, written on the recording thread, read on the GPU command thread).
+void NoteRecentBind(VAddr address, u64 size);
+[[nodiscard]] bool WasRecentlyBound(VAddr address, u64 size, u32 frames);
+
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
     static constexpr u64 ARENA_PAGE_BITS = 32;

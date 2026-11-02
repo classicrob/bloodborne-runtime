@@ -2102,6 +2102,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             }
                             polled += is_polled ? 1 : 0;
                             polled_unwaited += is_polled && state == 0 ? 1 : 0;
+                            // round 3: where the write lands (image / recently bound buffer / plain)
+                            static std::array<u64, 3> target{}, target_unwaited{};
+                            const u32 cls = rasterizer->WriteTargetClass(
+                                write_data->Address<VAddr>(), wd_bytes);
+                            ++target[cls];
+                            target_unwaited[cls] += state == 0 ? 1 : 0;
                             ++total;
                             bytes += (count - 2) * sizeof(u32);
                             in_place += VideoCore::GuestInPlace() ? 1 : 0;
@@ -2129,6 +2135,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                             (unsigned long long)polled,
                                             (unsigned long long)polled_unwaited);
                                 polled = polled_unwaited = 0;
+                                std::printf("WriteData targets (5 s): inside a cached image %llu "
+                                            "(%llu unwaited), in a buffer bound in the last 2 frames "
+                                            "%llu (%llu), plain memory %llu (%llu)\n",
+                                            (unsigned long long)target[1],
+                                            (unsigned long long)target_unwaited[1],
+                                            (unsigned long long)target[2],
+                                            (unsigned long long)target_unwaited[2],
+                                            (unsigned long long)target[0],
+                                            (unsigned long long)target_unwaited[0]);
+                                target = {};
+                                target_unwaited = {};
                                 states = {};
                                 sizes = {};
                                 size_unwaited = {};

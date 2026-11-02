@@ -1315,6 +1315,13 @@ void Rasterizer::NotePendingRead(VAddr address, u64 size) {
     }
 }
 
+u32 Rasterizer::WriteTargetClass(VAddr address, u64 size) {
+    if (texture_cache.HasImageInRange(address, size)) {
+        return 1;
+    }
+    return VideoCore::WasRecentlyBound(address, size, 2) ? 2 : 0;
+}
+
 u32 Rasterizer::PendingReadState(VAddr address, u64 size) const {
     if (!draw_pipe) {
         return 0;

@@ -124,6 +124,9 @@ public:
 
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
+    /// bbport BB_WRITEDATA_STATS (diagnostics): does any cached image overlap the range (locked;
+    /// callable from the GPU command thread).
+    [[nodiscard]] bool HasImageInRange(VAddr address, size_t size);
 
     /// bbport: a FindView result remembered by the caller for the same image and view info.
     struct ViewMemo {
