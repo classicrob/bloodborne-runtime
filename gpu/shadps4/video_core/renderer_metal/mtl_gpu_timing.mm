@@ -48,6 +48,7 @@ struct Record {
 bool enabled = false;
 bool split = false;    ///< BB_METAL_GPU_TIMING=2: vertex and fragment stage ends sampled too
 unsigned every = 1;    ///< BB_METAL_GPU_TIMING_EVERY: one frame in this many sampled
+FILE* frame_file = nullptr; ///< BB_METAL_GPU_TIMING_FRAMES=<file>: one line per frame
 FILE* gap_file = nullptr; ///< BB_METAL_GPU_TIMING_GAPS=<file>: every gap over 200 us, with times
 unsigned seq_from = 0, seq_to = 0; ///< BB_METAL_GPU_TIMING_SEQ=from-to: these positions in order
 std::string seq_anchor; ///< BB_METAL_GPU_TIMING_SEQ=[!]<text>:<count>[:<before>]: around the first (! the longest) encoder named so
@@ -225,6 +226,12 @@ void Init(id<MTLDevice> dev) {
     Calibrate(gpu0, steady0);
     last_report = steady0;
     split = env[0] == '2';
+    if (const char* f = std::getenv("BB_METAL_GPU_TIMING_FRAMES")) {
+        frame_file = std::fopen(f, "w");
+        if (frame_file) {
+            std::fprintf(frame_file, "# frame gpu_start_ns span_ms busy_ms idle_ms gaps encoders commit_late_ms\n");
+        }
+    }
     if (const char* g = std::getenv("BB_METAL_GPU_TIMING_GAPS")) {
         gap_file = std::fopen(g, "w");
         if (gap_file) {
@@ -603,6 +610,7 @@ void Report() {
                 }
             }
         }
+        const double busy0 = busy, idle0 = idle, gaps0 = gap_count, late0 = commit_late;
         const double first = list.front()->start;
         double reach = first, last = first;
         const Record* reaching = list.front();
@@ -685,6 +693,11 @@ void Report() {
             last = std::max(last, r->end);
         }
         span += (last - first) / 1e6;
+        if (frame_file) {
+            std::fprintf(frame_file, "%llu %.0f %.3f %.3f %.3f %.0f %zu %.3f\n", frame,
+                         double(steady0.time_since_epoch().count()) + first, (last - first) / 1e6,
+                         busy - busy0, idle - idle0, gap_count - gaps0, list.size(), commit_late - late0);
+        }
         if (prev_end >= 0 && first > prev_end) {
             between += (first - prev_end) / 1e6;
         }
@@ -743,6 +756,9 @@ void Report() {
     }
     if (gap_file) {
         std::fflush(gap_file);
+    }
+    if (frame_file) {
+        std::fflush(frame_file);
     }
     std::printf("  of the idle, %.2f ms/frame came before the next command buffer was committed (the GPU "
                 "waited for the CPU)\n", commit_late / n);
