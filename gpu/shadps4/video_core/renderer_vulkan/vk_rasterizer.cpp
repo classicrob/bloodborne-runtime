@@ -1814,7 +1814,17 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         // The resource tables the GPU thread walked must read the same now: else a write
         // still queued here (WriteData, DMA) changed them after that thread read them.
         static u32 flat_reports = 0;
-        for (u32 i = 0; i < packet.num_stages && flat_reports < 32; ++i) {
+        // bbport: every changed stage counted (the lines stop at 32), printed every 5 s.
+        static u64 checked = 0, changed = 0;
+        static auto last_count = std::chrono::steady_clock::now();
+        ++checked;
+        if (const auto now = std::chrono::steady_clock::now();
+            now - last_count > std::chrono::seconds(5)) {
+            last_count = now;
+            std::printf("Draw pipe verify: %llu packets checked, %llu stages with changed resource "
+                        "tables\n", (unsigned long long)checked, (unsigned long long)changed);
+        }
+        for (u32 i = 0; i < packet.num_stages; ++i) {
             const auto& snapshot = Shader::Info::ud_snapshots[i];
             const auto& srt = snapshot.info->srt_info;
             // Stages the pipeline selection did not refresh (no user data) keep their tables.
@@ -1834,6 +1844,10 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
             Shader::CallSrtWalker(srt.walker_func, snapshot.user_data, flat.data());
             runtime_fault_recover = nullptr;
             if (std::memcmp(flat.data(), snapshot.flat, snapshot.flat_size * sizeof(u32)) != 0) {
+                ++changed;
+                if (flat_reports >= 32) {
+                    continue;
+                }
                 u32 first = 0, count = 0;
                 for (u32 w = 0; w < snapshot.flat_size; ++w) {
                     if (flat[w] != snapshot.flat[w]) {
