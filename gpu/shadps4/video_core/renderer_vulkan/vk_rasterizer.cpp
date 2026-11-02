@@ -2472,8 +2472,15 @@ void Rasterizer::NoteDecodedPacket(bool work) {
     // At most once a frame: the gap to remove is the one at a frame's start, after the last
     // pass of the frame before (committing whenever the GPU caught up mid-frame, ~1.7 a frame,
     // cost more in drained draw pipes and split passes than it saved: 56 against 60-63 FPS).
+    // BB_EARLY_COMMIT_ANY=1: no once-a-frame limit, for the late commits at mid-frame boundaries
+    // (measured again with the game launched interactively: the first measurement, ~1.7 a frame,
+    // was taken while its threads woke up late).
+    static const bool any = [] {
+        const char* env = std::getenv("BB_EARLY_COMMIT_ANY");
+        return env && env[0] == '1';
+    }();
     const u64 frame = MetalLayer::PresentCount();
-    if (frame == early_frame) {
+    if (frame == early_frame && !any) {
         return;
     }
 #endif
