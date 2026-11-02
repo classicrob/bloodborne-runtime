@@ -1812,7 +1812,11 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     in += AlignPacket(u32(packet.num_vsharps * sizeof(AmdGpu::Buffer)));
     if (packet.verify) {
         // The resource tables the GPU thread walked must read the same now: else a write
-        // still queued here (WriteData, DMA) changed them after that thread read them.
+        // still queued here (WriteData, DMA) changed them after that thread read them. False
+        // alarms: a constant RAM dump later in the stream, which the GPU thread runs without
+        // draining (BB_CONSTRAM_PIPE), may rewrite them first; the draw binds the GPU thread's
+        // copy, the value in stream order (CY walk: 39 in 5.9 million packets, 0 with
+        // BB_CONSTRAM_PIPE=0).
         static u32 flat_reports = 0;
         // bbport: every changed stage counted (the lines stop at 32), printed every 5 s.
         static u64 checked = 0, changed = 0;
