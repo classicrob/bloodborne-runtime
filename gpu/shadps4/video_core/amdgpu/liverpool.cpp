@@ -133,6 +133,11 @@ void Liverpool::Process(std::stop_token stoken) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
 #endif
+#ifdef __APPLE__
+    // macOS has no per-thread CPU clock id: the Mach port, read with thread_info (BB_FRAME_LOG's
+    // stage_a_cpu_ms, the frame-stats stall lines).
+    BbStats::gpu_thread_mach.store(pthread_mach_thread_np(pthread_self()));
+#endif
     gpu_id = std::this_thread::get_id();
     gpu_tid = static_cast<u32>(bb_gettid());
 
