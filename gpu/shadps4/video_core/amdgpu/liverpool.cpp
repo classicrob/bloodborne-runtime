@@ -225,7 +225,12 @@ void Liverpool::Process(std::stop_token stoken) {
                 last_decoded = task.address();
                 BbTimeline::Note(BbTimeline::DecodeBegin, curr_qid, decoded_total);
             }
+            const auto resumed = std::chrono::steady_clock::now();
             task.resume();
+            BbStats::decode_wall_ns.fetch_add(
+                u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - resumed).count()),
+                std::memory_order_relaxed);
 
             if (task.done()) {
                 task.destroy();
