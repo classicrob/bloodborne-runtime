@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
+#include "bbport_stage_a.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -521,6 +522,7 @@ void NoteDrawTarget(const AmdGpu::Regs& regs) {
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            const PreparedDraw* prepared,
                                                            bool indirect, bool allow_fixed_quad) {
+    BB_STAGE_A(Pipeline);
     used_prepared = nullptr;
     sel.indirect = indirect;
     sel.allow_fixed_quad = allow_fixed_quad;
@@ -530,11 +532,17 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     const bool try_prepared = !allow_fixed_quad || !FixedQuadTrianglesEnabled() || indirect ||
         liverpool->regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::LsHs;
     if (prepared && try_prepared) {
-        if (const auto* pipeline = TryPreparedPipeline(*prepared)) {
+        const GraphicsPipeline* pipeline;
+        {
+            BB_STAGE_A(Prepared);
+            pipeline = TryPreparedPipeline(*prepared);
+        }
+        if (pipeline) {
             used_prepared = prepared;
             return pipeline;
         }
     }
+    BB_STAGE_A(Select);
     sel.draw_indirect_params = params;
     if (!RefreshGraphicsKey(sel)) {
         return nullptr;

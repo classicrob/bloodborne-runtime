@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "bbport_timeline.h"
 #include "bbport_sections.h"
+#include "bbport_stage_a.h"
 #include "game_profile.h"
 #include "bbport_ce_stats.h"
 #include "bbport_toggles.h"
@@ -1453,6 +1454,7 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
 void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_prepared,
                           bool is_indexed, u32 index_offset, const AmdGpu::ComputeProgram* cs,
                           const IndirectDraw* indirect) {
+    BB_STAGE_A(PostDraw);
     auto& dirty = liverpool->pipe_dirty;
     if (!pipe_synced) {
         // Stage B has not run yet: its register copy starts as this one.
@@ -1546,6 +1548,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
             }
             ring.clear();
             if (constant_ring && !BbToggle::Disabled(BbToggle::ConstantRing)) {
+                BB_STAGE_A(Rings);
                 CollectRingBindings(*stage, used_prepared, ring);
             } else {
                 untracked_reads_packet = draw_pipe->NextPacket(); // bindings not listed
@@ -2052,6 +2055,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
         return;
     }
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
+    // bbport BB_STAGE_A_LOG (diagnostics): stage A's time per part, per frame.
+    if (BbStageA::Enabled() && OnStageA()) {
+        BbStageA::stage_a = true;
+        BbStageA::FrameCheck(BbStats::frame_number.load(std::memory_order_relaxed),
+                             draw_pipe ? draw_pipe->drain_cycles : 0);
+    }
+    BB_STAGE_A(Draw);
+    BbStageA::Add(BbStageA::Draws);
 
     // bbport: with the draw pipeline this thread only selects the pipeline and hands the draw
     // to the recording thread (DrawRecord there); draws FilterDraw handles itself run here.
@@ -2071,6 +2082,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
     }
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline({}, prepared);
     const PreparedDraw* used_prepared = pipeline_cache.UsedPrepared();
+    if (used_prepared) {
+        BbStageA::Add(BbStageA::PreparedUsed);
+    }
     if (prepared) {
         draw_prep->Count(pipeline != nullptr &&
                          prepared->state.load(std::memory_order_acquire) == PreparedDraw::Ready &&
@@ -2638,6 +2652,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
+    BB_STAGE_A(Dispatch);
+    BbStageA::Add(BbStageA::Dispatches);
     BbStats::dispatches.fetch_add(1, std::memory_order_relaxed);
     // bbport: like draws, handed to the draw recording thread after the pipeline selection.
     const bool pipelined = UseDrawPipe() && !BbToggle::Disabled(BbToggle::PipelinedDispatch);
