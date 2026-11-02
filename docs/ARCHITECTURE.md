@@ -139,6 +139,13 @@ records them. `BB_DRAW_PIPE=0` runs both in one thread. Most of bbport's speed-u
 off at run time for bisection: `BB_TOGGLE_FILE` names a file holding a bit mask (re-read every
 250 ms).
 
+**Barriers.** The barrier tracker (`Runtime::AccessBuffer`) keeps the ranges draws and dispatches
+read exactly as declared (toggle bit `CoarseReadTracking`: rounded out to 4 KiB, as before), so a
+copy written next to data a draw read is not taken for a conflict. The copy shader's copies are
+then moved before the open render pass (`BB_HOIST_COPIES`) instead of splitting it; that move
+checks each copy against the pass's earlier ones in merged interval sets
+(`BB_HOIST_INTERVAL_SETS=0`: a scan of every earlier range).
+
 **Memory on the GPU.** The game's memory pool is used in place as GPU buffers, so the GPU reads
 the game's data where it is. It is split into two overlapping windows (3,584 and 3,520 MiB) so no
 binding offset reaches 4 GiB, where MoltenVK draws wrongly (`BufferCache::pool_upper`;
