@@ -213,14 +213,15 @@ private:
         return yields;
     }
 
-    /// Whether stage A's drain waits sleep after 4096 pauses instead of yielding
-    /// (BB_PIPE_DRAIN_WAIT=1, a test): SleepUntil, woken by stage B after its next packet. A yield
-    /// lowers the thread's priority on macOS; a sleep on an address does not, and keeps the core free
-    /// while stage B is blocked inside a packet. The frame log then counts one yield per sleep.
+    /// Whether stage A's drain waits sleep after 4096 pauses instead of yielding (default;
+    /// BB_PIPE_DRAIN_WAIT=0: the yield): SleepUntil, woken by stage B after its next packet. A yield
+    /// lowers the thread's priority on macOS, and stage A resumed up to ~3 ms after stage B finished
+    /// in the CY walk's slow frames; a sleep on an address does not, and keeps the core free while
+    /// stage B is blocked inside a packet. The frame log then counts one yield per sleep.
     static bool DrainSleeps() {
         static const bool sleeps = [] {
             const char* env = std::getenv("BB_PIPE_DRAIN_WAIT");
-            return env && env[0] == '1';
+            return !(env && env[0] == '0');
         }();
         return sleeps;
     }
@@ -369,7 +370,7 @@ private:
     alignas(64) std::atomic<u64> consumed{0};
     std::atomic<u64> consumed_packets{0}; ///< packets stage B has run (NextPacket numbers)
     std::atomic<u32> progress{0};     ///< bumped by stage B after each packet or wrap
-    std::atomic<bool> waiting{false}; ///< stage A sleeps on `progress` (BB_PIPE_DRAIN_WAIT=1)
+    std::atomic<bool> waiting{false}; ///< stage A sleeps on `progress` (BB_PIPE_DRAIN_WAIT)
     std::array<std::atomic<u64>, 64> packet_end{}; ///< __rdtsc when stage B ended packet n (n % 64)
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
