@@ -1374,8 +1374,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     // as before), constant data from ring allocations landed in ranges already present and the
     // tree grew less, but copies next to data a draw read looked like conflicts: the copy
     // shader's copies were no longer hoisted before the render pass (~8 a frame in the clinic)
-    // and split the G-buffer pass instead. Exact: clinic 45.4 -> 49.0 FPS, Hunter's Dream 75.3
-    // -> 81.1, the GPU thread's time per draw unchanged.
+    // and split the G-buffer pass instead. Measured: docs/PERFORMANCE.md (exact read tracking).
     if (!(src_access & WRITE_MASK) && BbToggle::Disabled(BbToggle::CoarseReadTracking)) {
         range.range_start &= ~u64{0xFFF};
         range.range_end |= 0xFFF;
