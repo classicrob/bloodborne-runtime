@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "bbport_frame_rate.h"
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -452,6 +455,17 @@ void VideoOutDriver::Flip(const Request& req) {
             clock_gettime(static_cast<clockid_t>(clock), &ts);
             gpu_ns = u64(ts.tv_sec) * 1000000000ull + u64(ts.tv_nsec);
         }
+#ifdef __APPLE__
+        if (const unsigned port = BbStats::gpu_thread_mach.load(); port != 0) {
+            thread_basic_info_data_t info{};
+            mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(port, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) ==
+                KERN_SUCCESS) {
+                gpu_ns = (u64(info.user_time.seconds) + u64(info.system_time.seconds)) * 1000000000ull +
+                         (u64(info.user_time.microseconds) + u64(info.system_time.microseconds)) * 1000ull;
+            }
+        }
+#endif
         const u64 images = BbStats::images_registered.load();
         const u64 image_bytes = BbStats::image_upload_bytes.load();
         const u64 buffer_bytes = BbStats::buffer_upload_bytes.load();
