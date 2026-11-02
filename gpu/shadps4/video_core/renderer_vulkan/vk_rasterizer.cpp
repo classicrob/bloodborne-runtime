@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "bbport_timeline.h"
 #include "bbport_sections.h"
+#include "bbport_stale_desc.h"
 #include "game_profile.h"
 #include "bbport_ce_stats.h"
 #include "bbport_toggles.h"
@@ -2089,6 +2090,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                             bool is_indexed, u32 index_offset) {
     BB_SECTION(DrawRecord);
+    if (BbStaleDesc::Enabled()) [[unlikely]] {
+        BbStaleDesc::prepared_by_worker = used_prepared ? 1 : 0;
+    }
     buffer_cache.NewPacket();
     if (FrameCapture::Active()) {
         FrameCapture::BeginCommand("draw", device.CurrentTick(),

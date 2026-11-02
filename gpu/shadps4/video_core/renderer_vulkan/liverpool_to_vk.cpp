@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "bbport_stale_desc.h"
 #include "common/assert.h"
 #include "common/number_utils.h"
 #include "video_core/amdgpu/pixel_format.h"
@@ -801,6 +802,11 @@ Backend::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberForm
         if (result != Backend::Format::Undefined) {
             break;
         }
+    }
+    if (BbStaleDesc::Enabled()) {
+        BbStaleDesc::Report(static_cast<u32>(data_format), static_cast<u32>(num_format),
+                            result != Backend::Format::Undefined);
+        return result; // diagnostics: keep going as Undefined instead of the assertion below
     }
     static std::atomic<u32> reported{0};
     if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {

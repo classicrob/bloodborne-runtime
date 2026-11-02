@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "bbport_stale_desc.h"
 #include "common/assert.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/buffer.h"
@@ -57,7 +58,11 @@ ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
     props.is_tiled = buffer.IsTiled();
     tile_mode = buffer.GetTileMode();
     array_mode = AmdGpu::GetArrayMode(tile_mode);
-    pixel_format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+    {
+        const BbStaleDesc::Scope scope{"color buffer (image)", &buffer, sizeof(buffer),
+                                       buffer.Address()};
+        pixel_format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+    }
     num_samples = buffer.NumSamples();
     num_bits = NumBitsPerBlock(buffer.GetDataFmt());
     type = AmdGpu::ImageType::Color2D;
@@ -118,7 +123,10 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
 ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept {
     tile_mode = image.GetTileMode();
     array_mode = AmdGpu::GetArrayMode(tile_mode);
-    pixel_format = LiverpoolToVK::SurfaceFormat(image.GetDataFmt(), image.GetNumberFmt());
+    {
+        const BbStaleDesc::Scope scope{"texture T# (image)", &image, sizeof(image), image.Address()};
+        pixel_format = LiverpoolToVK::SurfaceFormat(image.GetDataFmt(), image.GetNumberFmt());
+    }
     if (desc.is_depth) {
         pixel_format = LiverpoolToVK::PromoteFormatToDepth(pixel_format);
         props.is_depth = true;
