@@ -1429,6 +1429,9 @@ void Runtime::FlushBarriers() {
                     VkImage(MetalLayer::ImageOfView(state.depth_stencil_attachment.image_view));
             }
             for (const auto& barrier : image_barriers) {
+                // A graphics-stage source (a storage image a fragment shader wrote) may have been
+                // written by this pass's draws: the next draw must not read it in the same encoder.
+                keep_pass &= !IsGraphicsStage(barrier.srcStageMask);
                 const VkImage image = static_cast<VkImage>(barrier.image);
                 for (u32 i = 0; i < n; ++i) {
                     // An attachment whose image is not known counts as this image.
