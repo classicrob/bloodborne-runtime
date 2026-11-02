@@ -203,6 +203,15 @@ private:
         on_stage_b = true;
         BbSections::recording_thread = true;
         stage_b_tid.store(static_cast<u32>(bb_gettid()), std::memory_order_release);
+        // bbport BB_DRAWREC_QOS=1 (experiment, Shaders): the recording thread at the GPU command
+        // thread's class (MakeCritical: user-interactive on Apple platforms). Without it the
+        // thread keeps the class it inherited from the thread that made the rasterizer. The
+        // class is printed either way (Apple's qos_class_t: 0x21 user-interactive, 0x19
+        // user-initiated, 0x15 default, 0x11 utility, 0 unspecified).
+        if (const char* env = std::getenv("BB_DRAWREC_QOS"); env && env[0] == '1') {
+            BbThreads::MakeCritical();
+        }
+        std::printf("Draw pipe: recording thread QoS class %#x\n", bb_thread_qos_self());
         u64 at = 0;
         while (true) {
             // Packets follow each other within microseconds while a frame is decoded: spin,
