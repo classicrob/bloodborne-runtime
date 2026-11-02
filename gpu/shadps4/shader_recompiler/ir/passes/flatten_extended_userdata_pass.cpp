@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <array>
+#include <atomic>
+#include <cstdio>
 
 #include <cstdlib>
 #include <cstring>
@@ -260,6 +263,63 @@ void CallSrtWalker(PFN_SrtWalker walker, const u32* user_data, u32* flat_dst) {
 #endif
 }
 
+namespace {
+struct UnwrittenRange {
+    std::atomic<u64> base{0}, size{0};
+};
+std::array<UnwrittenRange, 256> unwritten_ranges;
+std::atomic<u32> unwritten_count{0};
+std::atomic<u64> stale_range_hits{0};
+} // namespace
+
+bool StaleRangeCheckOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_STALE_RANGE_CHECK");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+void NoteUnwrittenRange(u64 base, u64 size) {
+    if (!StaleRangeCheckOn()) {
+        return;
+    }
+    const u32 n = std::min<u32>(unwritten_count.load(std::memory_order_acquire),
+                                unwritten_ranges.size());
+    for (u32 i = 0; i < n; ++i) {
+        if (unwritten_ranges[i].base.load(std::memory_order_relaxed) == base) {
+            return;
+        }
+    }
+    const u32 slot = unwritten_count.fetch_add(1, std::memory_order_acq_rel);
+    if (slot < unwritten_ranges.size()) {
+        unwritten_ranges[slot].size.store(size, std::memory_order_relaxed);
+        unwritten_ranges[slot].base.store(base, std::memory_order_release);
+        std::printf("Stale range check: range %u %#llx+%#llx no longer written by the GPU\n", slot,
+                    (unsigned long long)base, (unsigned long long)size);
+    }
+}
+
+void CheckWalkerLoad(const void* address, u32 size) {
+    const u64 a = reinterpret_cast<u64>(address);
+    const u32 n = std::min<u32>(unwritten_count.load(std::memory_order_acquire),
+                                unwritten_ranges.size());
+    for (u32 i = 0; i < n; ++i) {
+        const u64 base = unwritten_ranges[i].base.load(std::memory_order_acquire);
+        const u64 range = unwritten_ranges[i].size.load(std::memory_order_relaxed);
+        if (base && a + size > base && a < base + range) {
+            const u64 hits = stale_range_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (hits <= 20 || hits % 4096 == 0) {
+                std::printf("Stale range check: walker load %#llx+%u inside range %u (%#llx+%#llx), "
+                            "%llu hits\n",
+                            (unsigned long long)a, size, i, (unsigned long long)base,
+                            (unsigned long long)range, (unsigned long long)hits);
+            }
+            return;
+        }
+    }
+}
+
 void RunSrtProgram(const u32* program, const u32* user_data, u32* flat) {
     u32* const code = const_cast<u32*>(program);
     sigjmp_buf* const previous = runtime_fault_recover;
@@ -290,6 +350,9 @@ void RunSrtProgram(const u32* program, const u32* user_data, u32* flat) {
                 runtime_fault_recover = &recover;
                 std::memcpy(&next, pointer + offset, sizeof(next));
                 runtime_fault_recover = previous;
+                if (StaleRangeCheckOn()) [[unlikely]] {
+                    CheckWalkerLoad(pointer + offset, sizeof(next));
+                }
             }
             stack[depth++] = pointer;
             pointer = reinterpret_cast<const u8*>(next & 0xFFFFFFFFFFFFull);
@@ -308,6 +371,9 @@ void RunSrtProgram(const u32* program, const u32* user_data, u32* flat) {
                 runtime_fault_recover = &recover;
                 std::memcpy(&value, pointer + offset, sizeof(value));
                 runtime_fault_recover = previous;
+                if (StaleRangeCheckOn()) [[unlikely]] {
+                    CheckWalkerLoad(pointer + offset, sizeof(value));
+                }
             }
             flat[code[pc++]] = value;
             break;

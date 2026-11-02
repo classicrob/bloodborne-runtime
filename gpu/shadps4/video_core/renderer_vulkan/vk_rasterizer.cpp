@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/vk_state.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "video_core/renderer_vulkan/vk_format.h"
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "bbport_timeline.h"
@@ -4217,6 +4218,8 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
                 .extent = {.levels = 1, .layers = 1},
             };
             runtime.ClearImage(&image, range, clear);
+            // bbport BB_STALE_RANGE_CHECK: this layer's guest memory is no longer written.
+            Shader::NoteUnwrittenRange(base, size);
             static std::atomic<u64> layer_clears{0};
             if (const u64 n = ++layer_clears; n == 1 || n % 4096 == 0) {
                 std::printf("Layer clears: %llu (array layer fills cleared as images)\n",

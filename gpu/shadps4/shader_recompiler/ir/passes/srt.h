@@ -32,6 +32,13 @@ inline const void* SrtWalkerCode(PFN_SrtWalker walker) { return walker.code; }
 void RunSrtProgram(const u32* program, const u32* user_data, u32* flat_dst);
 #endif
 bool UsePortableSrtWalker();
+
+/// bbport BB_STALE_RANGE_CHECK=1 (diagnostics): guest ranges whose memory a renderer substitution
+/// no longer writes (experiment bit 18's layer clears); the walker counts any load from them, to
+/// test whether descriptors are ever read from such memory.
+bool StaleRangeCheckOn();
+void NoteUnwrittenRange(u64 base, u64 size);
+void CheckWalkerLoad(const void* address, u32 size);
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
 
 /// Run x86 code natively, translated x86 code on arm64, or a portable SRT program.
