@@ -427,6 +427,9 @@ struct CompileTimer {
 };
 } // namespace
 
+static bool PreparedVertexFormatsMatch(const GraphicsPipeline& pipeline,
+                                       const GraphicsPipelineKey& key);
+
 bool PipelineCache::PrepareGraphicsPipeline(PipelineSelection& worker_sel) {
     // Tessellation stages read constant buffers from memory at selection time: not prepared.
     if (worker_sel.regs->stage_enable.hs_en) {
@@ -474,8 +477,14 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
     }
     const auto it = graphics_pipelines.find(prepared.key);
     // A pipeline the driver could not create is empty: no pipeline, the draw is skipped.
-    return it != graphics_pipelines.end() && it->second && it->second->Handle() ? it->second.get()
-                                                                                : nullptr;
+    if (it == graphics_pipelines.end() || !it->second || !it->second->Handle()) {
+        return nullptr;
+    }
+    if (!device.GetCapabilities().dynamic_vertex_input &&
+        !PreparedVertexFormatsMatch(*it->second, prepared.key)) {
+        return nullptr;
+    }
+    return it->second.get();
 }
 
 namespace {
@@ -763,6 +772,63 @@ bool RectsAsTriangles() {
     return enabled;
 }
 
+/// bbport: the format of a vertex attribute's V#. A draw-preparation worker reads the V# tables
+/// ahead of the GPU thread, while the game may still be writing them: a combination no format
+/// has (seen: data/number format 6/1, 6/5, 9/7) fails the worker's preparation, and the GPU
+/// thread selects that draw itself when it gets there (SurfaceFormat asserted on the worker and
+/// stopped the game). The GPU thread checks the formats of every prepared key it uses
+/// (PreparedVertexFormatsMatch). Unlike SurfaceFormat no other number format is tried, so a draw
+/// whose format exists only that way is always selected on the GPU thread.
+static std::optional<VideoCore::Backend::Format> VertexFormat(const PipelineSelection& sel,
+                                                              const AmdGpu::Buffer& buffer) {
+    if (!sel.worker) {
+        return LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+    }
+    const auto format = LiverpoolToVK::TrySurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+    if (format == VideoCore::Backend::Format::Undefined &&
+        buffer.GetDataFmt() != AmdGpu::DataFormat::FormatInvalid) {
+        sel.worker->failed = true;
+        static std::atomic<u32> count{0};
+        const u32 n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n & 1023) == 0) {
+            std::printf("Draw preparation: vertex format data %u number %u unknown (a stale V#?): "
+                        "the draw left to the GPU thread (%u so far)\n",
+                        u32(buffer.GetDataFmt()), u32(buffer.GetNumberFmt()), n);
+        }
+        return std::nullopt;
+    }
+    return format;
+}
+
+/// bbport: the vertex formats of a key a worker prepared, read again on the GPU thread from the
+/// V# tables of this draw (the user data compare in TryPreparedPipeline does not cover memory
+/// behind the table pointers). A difference leaves the draw to the regular selection.
+static bool PreparedVertexFormatsMatch(const GraphicsPipeline& pipeline,
+                                       const GraphicsPipelineKey& key) {
+    const auto& fetch = pipeline.GetFetchShader();
+    if (!fetch) {
+        return true;
+    }
+    const auto& vs = pipeline.GetStage(Shader::SwStage::Vertex);
+    if (fetch->attributes.size() > MaxVertexBufferCount) {
+        return false;
+    }
+    for (size_t i = 0; i < fetch->attributes.size(); ++i) {
+        const auto buffer = fetch->attributes[i].GetSharp(vs);
+        if (LiverpoolToVK::TrySurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()) !=
+            key.vertex_buffer_formats[i]) {
+            static std::atomic<u32> count{0};
+            const u32 n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n & 1023) == 0) {
+                std::printf("Draw preparation: a prepared key's vertex format changed before its "
+                            "draw: selected again (%u so far)\n", n);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 /// bbport: the vertex stage of a rect list can be drawn as triangles with corners the CPU adds:
 /// a passthrough (Info::rect_position_attr) of 32-bit float attributes, position per vertex.
 static bool RectPassthrough(const PipelineSelection& sel) {
@@ -784,8 +850,11 @@ static bool RectPassthrough(const PipelineSelection& sel) {
             continue;
         }
         const auto buffer = attrib.GetSharp(*vs);
-        const u32 components = RectAttributeComponents(
-            LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()));
+        const auto format = VertexFormat(sel, buffer);
+        if (!format) {
+            return false;
+        }
+        const u32 components = RectAttributeComponents(*format);
         if (components == 0) {
             return false;
         }
@@ -1265,14 +1334,19 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     if (vs_info && sel.fetch_shader && !device.GetCapabilities().dynamic_vertex_input) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
+        // bbport: one format per fetch attribute, none skipped: PreparedVertexFormatsMatch
+        // compares format i with attribute i.
         u32 vertex_binding = 0;
         for (const auto& attrib : sel.fetch_shader->attributes) {
             const auto& buffer = attrib.GetSharp(*vs_info);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
                        MaxVertexBufferCount);
-            key.vertex_buffer_formats[vertex_binding++] =
-                Vulkan::LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+            const auto format = VertexFormat(sel, buffer);
+            if (!format) {
+                return false;
+            }
+            key.vertex_buffer_formats[vertex_binding++] = *format;
         }
     }
 
