@@ -21,6 +21,7 @@
 #include <pthread.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -92,6 +93,9 @@ public:
         published.store(head, std::memory_order_seq_cst);
         ++packets;
         if (sleeping.load(std::memory_order_seq_cst)) {
+            // BB_FRAME_LOG: a post to a sleeping stage B, timed until it runs again (wake_latency_ms).
+            BbStats::pipe_wake_posts.fetch_add(1, std::memory_order_relaxed);
+            wake_posted.store(__rdtsc(), std::memory_order_relaxed);
             wake.fetch_add(1, std::memory_order_seq_cst);
             wake.notify_one();
         }
@@ -119,17 +123,15 @@ public:
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
         const u64 start = __rdtsc();
-        for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
+        u32 spins = 0;
+        for (; consumed.load(std::memory_order_acquire) != head; ++spins) {
             if (spins < 4096) {
                 __builtin_ia32_pause();
             } else {
                 std::this_thread::yield();
             }
         }
-        const u64 waited = __rdtsc() - start;
-        drain_cycles += waited;
-        cycles_by_reason[slot] += waited;
-        BbStats::pipe_drain_ticks.fetch_add(waited, std::memory_order_relaxed);
+        FinishWait(start, packets, spins, slot);
     }
 
     /// Stage A: the number the next committed packet gets (packets are numbered from 1), and
@@ -149,17 +151,15 @@ public:
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
         const u64 start = __rdtsc();
-        for (u32 spins = 0; !ReachedPacket(number); ++spins) {
+        u32 spins = 0;
+        for (; !ReachedPacket(number); ++spins) {
             if (spins < 4096) {
                 __builtin_ia32_pause();
             } else {
                 std::this_thread::yield();
             }
         }
-        const u64 waited = __rdtsc() - start;
-        drain_cycles += waited;
-        cycles_by_reason[slot] += waited;
-        BbStats::pipe_drain_ticks.fetch_add(waited, std::memory_order_relaxed);
+        FinishWait(start, number, spins, slot);
     }
 
     /// Stage A: position after the last committed packet; Reached(position) once B ran it.
@@ -198,6 +198,32 @@ private:
         return (size + 63) & ~63u;
     }
 
+    /// Stage A, after a drain wait for packet `number`: the statistics, and for BB_FRAME_LOG the
+    /// handover (from stage B ending that packet to stage A seeing it) and the yields it took.
+    void FinishWait(u64 start, u64 number, u32 spins, u32 slot) {
+        const u64 now = __rdtsc();
+        const u64 waited = now - start;
+        drain_cycles += waited;
+        cycles_by_reason[slot] += waited;
+        BbStats::pipe_drain_ticks.fetch_add(waited, std::memory_order_relaxed);
+        BbStats::pipe_drain_waits.fetch_add(1, std::memory_order_relaxed);
+        if (spins > 4096) {
+            BbStats::pipe_drain_yields.fetch_add(spins - 4096, std::memory_order_relaxed);
+        }
+        // Stage B may be up to 64 packets past `number` (WaitForPacket) before its end is overwritten.
+        const u64 ended = packet_end[number % packet_end.size()].load(std::memory_order_relaxed);
+        const u64 handover = now - std::min(now, std::max(ended, start));
+        BbStats::pipe_handover_ticks.fetch_add(handover, std::memory_order_relaxed);
+        if (handover >= 240'000) { // 100 us
+            BbStats::pipe_slow_handovers.fetch_add(1, std::memory_order_relaxed);
+        }
+        u64 longest = BbStats::pipe_handover_max_ticks.load(std::memory_order_relaxed);
+        while (handover > longest &&
+               !BbStats::pipe_handover_max_ticks.compare_exchange_weak(longest, handover,
+                                                                       std::memory_order_relaxed)) {
+        }
+    }
+
     void WaitForSpace(u64 at, u64 size) {
         if (at + size - consumed.load(std::memory_order_acquire) <= Capacity) {
             return;
@@ -219,10 +245,12 @@ private:
         BbSections::recording_thread = true;
         stage_b_tid.store(static_cast<u32>(bb_gettid()), std::memory_order_release);
         u64 at = 0;
+        u64 last_end = 0; ///< when the previous packet ended (BB_FRAME_LOG: gaps between packets)
         while (true) {
             // Packets follow each other within microseconds while a frame is decoded: spin,
             // and sleep only after a longer pause (between frames).
             u64 available = published.load(std::memory_order_acquire);
+            const bool ready = available != at;
             if (available == at) {
                 // With few hardware threads (Steam Deck: 8) a long spin takes time from the
                 // game's own threads. BB_PIPE_SPIN_US overrides.
@@ -244,6 +272,10 @@ private:
                         if (published.load(std::memory_order_seq_cst) == at &&
                             !stop.stop_requested()) {
                             wake.wait(seen, std::memory_order_seq_cst);
+                            if (const u64 posted = wake_posted.exchange(0, std::memory_order_relaxed)) {
+                                BbStats::pipe_wake_ticks.fetch_add(__rdtsc() - posted,
+                                                                   std::memory_order_relaxed);
+                            }
                         }
                         sleeping.store(false, std::memory_order_relaxed);
                     }
@@ -257,10 +289,19 @@ private:
                 continue;
             }
             const u64 start = __rdtsc();
+            if (ready && last_end != 0) {
+                // The next packet was already there: time between packets that is not waiting for work.
+                BbStats::pipe_gap_ticks.fetch_add(start - last_end, std::memory_order_relaxed);
+            }
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
-            busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
+            last_end = __rdtsc();
+            const u64 ran = last_end - start;
+            busy_cycles.fetch_add(ran, std::memory_order_relaxed);
+            BbStats::pipe_busy_ticks.fetch_add(ran, std::memory_order_relaxed);
             at += header->size;
-            consumed_packets.fetch_add(1, std::memory_order_release);
+            const u64 number = consumed_packets.load(std::memory_order_relaxed) + 1;
+            packet_end[number % packet_end.size()].store(last_end, std::memory_order_relaxed);
+            consumed_packets.store(number, std::memory_order_release);
             consumed.store(at, std::memory_order_release);
         }
     }
@@ -274,8 +315,10 @@ private:
     alignas(64) std::atomic<u64> published{0};
     alignas(64) std::atomic<u64> consumed{0};
     std::atomic<u64> consumed_packets{0}; ///< packets stage B has run (NextPacket numbers)
+    std::array<std::atomic<u64>, 64> packet_end{}; ///< __rdtsc when stage B ended packet n (n % 64)
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
+    std::atomic<u64> wake_posted{0}; ///< __rdtsc of the last post to a sleeping stage B (statistics)
     std::atomic<u32> stage_b_tid{0};
     std::jthread thread;
 };
