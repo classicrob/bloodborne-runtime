@@ -169,6 +169,19 @@ Metal backend is accepted (the Metal backend, step M4). Linux keeps its Vulkan b
 [Render adapter](RENDER_ADAPTER.md); the renderer's status and next steps:
 [Native renderer](NATIVE_RENDERER.md#the-layers).
 
+**Ordering on the Metal renderer.** A barrier encodes nothing on Metal: the renderer orders its
+encoders instead. A barrier inside a render pass leaves the pass open unless the pass's own draws
+may have written what is waited for (a graphics-stage source, buffer or image) or an image barrier
+is on one of its attachments (`BB_BARRIERS_IN_PASS=0`: every barrier ends the pass). Render
+encoders declare no guest memory; Metal fences order them against the compute and blit encoders
+around them: each render encoder waits for the last compute or blit encoder, and after a barrier
+the next compute or blit encoder waits for the render encoders before it, ending an open compute
+encoder if render work is outstanding (`BB_METAL_FENCED_ORDERING=0`: the old declarations, which
+let Metal's hazard tracking order every encoder; `BB_METAL_RENDER_WRITES=1` keeps them with the
+fences). Buffer copies, fills and updates of at most `BB_COPY_COMPUTE_MAX` bytes (64 KiB) recorded
+while a compute encoder is open run as a compute dispatch in it instead of a blit
+(`BB_COPIES_AS_COMPUTE=0`: always a blit).
+
 ## Settings, the menu and the launcher
 
 `gpu/shim/bbport_settings.*` holds the game settings (`bbport.ini`) and the launcher's own options
