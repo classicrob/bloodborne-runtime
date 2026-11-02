@@ -16,6 +16,10 @@
 #include <cstdlib>
 #include "bbport_threads.h"
 #include "bbport_sections.h"
+#include "bbport_toggles.h"
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -125,6 +129,7 @@ public:
         const u64 waited = __rdtsc() - start;
         drain_cycles += waited;
         cycles_by_reason[slot] += waited;
+        BbStats::pipe_drain_ticks.fetch_add(waited, std::memory_order_relaxed);
     }
 
     /// Stage A: the number the next committed packet gets (packets are numbered from 1), and
@@ -154,6 +159,7 @@ public:
         const u64 waited = __rdtsc() - start;
         drain_cycles += waited;
         cycles_by_reason[slot] += waited;
+        BbStats::pipe_drain_ticks.fetch_add(waited, std::memory_order_relaxed);
     }
 
     /// Stage A: position after the last committed packet; Reached(position) once B ran it.
@@ -193,13 +199,22 @@ private:
     }
 
     void WaitForSpace(u64 at, u64 size) {
+        if (at + size - consumed.load(std::memory_order_acquire) <= Capacity) {
+            return;
+        }
+        // The ring is full: stage A waits for stage B (counted for BB_FRAME_LOG's ring_wait_ms).
+        const u64 start = __rdtsc();
         while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
             __builtin_ia32_pause();
         }
+        BbStats::pipe_space_ticks.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
     }
 
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("bb:DrawRec");
+#ifdef __APPLE__
+        BbStats::draw_rec_mach.store(pthread_mach_thread_np(pthread_self()));
+#endif
         on_stage_b = true;
         BbSections::recording_thread = true;
         stage_b_tid.store(static_cast<u32>(bb_gettid()), std::memory_order_release);
