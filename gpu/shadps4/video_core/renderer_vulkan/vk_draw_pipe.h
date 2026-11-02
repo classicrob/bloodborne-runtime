@@ -16,6 +16,10 @@
 #include <cstdlib>
 #include "bbport_threads.h"
 #include "bbport_sections.h"
+#include "bbport_toggles.h"
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -88,6 +92,9 @@ public:
         published.store(head, std::memory_order_seq_cst);
         ++packets;
         if (sleeping.load(std::memory_order_seq_cst)) {
+            // BB_FRAME_LOG: a post to a sleeping stage B, timed until it runs again (wake_latency_ms).
+            BbStats::pipe_wake_posts.fetch_add(1, std::memory_order_relaxed);
+            wake_posted.store(__rdtsc(), std::memory_order_relaxed);
             wake.fetch_add(1, std::memory_order_seq_cst);
             wake.notify_one();
         }
@@ -125,6 +132,7 @@ public:
         const u64 waited = __rdtsc() - start;
         drain_cycles += waited;
         cycles_by_reason[slot] += waited;
+        BbStats::pipe_drain_ticks.fetch_add(waited, std::memory_order_relaxed);
     }
 
     /// Stage A: the number the next committed packet gets (packets are numbered from 1), and
@@ -154,6 +162,7 @@ public:
         const u64 waited = __rdtsc() - start;
         drain_cycles += waited;
         cycles_by_reason[slot] += waited;
+        BbStats::pipe_drain_ticks.fetch_add(waited, std::memory_order_relaxed);
     }
 
     /// Stage A: position after the last committed packet; Reached(position) once B ran it.
@@ -193,13 +202,22 @@ private:
     }
 
     void WaitForSpace(u64 at, u64 size) {
+        if (at + size - consumed.load(std::memory_order_acquire) <= Capacity) {
+            return;
+        }
+        // The ring is full: stage A waits for stage B (counted for BB_FRAME_LOG's ring_wait_ms).
+        const u64 start = __rdtsc();
         while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
             __builtin_ia32_pause();
         }
+        BbStats::pipe_space_ticks.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
     }
 
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("bb:DrawRec");
+#ifdef __APPLE__
+        BbStats::draw_rec_mach.store(pthread_mach_thread_np(pthread_self()));
+#endif
         on_stage_b = true;
         BbSections::recording_thread = true;
         stage_b_tid.store(static_cast<u32>(bb_gettid()), std::memory_order_release);
@@ -238,6 +256,10 @@ private:
                         if (published.load(std::memory_order_seq_cst) == at &&
                             !stop.stop_requested()) {
                             wake.wait(seen, std::memory_order_seq_cst);
+                            if (const u64 posted = wake_posted.exchange(0, std::memory_order_relaxed)) {
+                                BbStats::pipe_wake_ticks.fetch_add(__rdtsc() - posted,
+                                                                   std::memory_order_relaxed);
+                            }
                         }
                         sleeping.store(false, std::memory_order_relaxed);
                     }
@@ -252,7 +274,9 @@ private:
             }
             const u64 start = __rdtsc();
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
-            busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
+            const u64 ran = __rdtsc() - start;
+            busy_cycles.fetch_add(ran, std::memory_order_relaxed);
+            BbStats::pipe_busy_ticks.fetch_add(ran, std::memory_order_relaxed);
             at += header->size;
             consumed_packets.fetch_add(1, std::memory_order_release);
             consumed.store(at, std::memory_order_release);
@@ -270,6 +294,7 @@ private:
     std::atomic<u64> consumed_packets{0}; ///< packets stage B has run (NextPacket numbers)
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
+    std::atomic<u64> wake_posted{0}; ///< __rdtsc of the last post to a sleeping stage B (statistics)
     std::atomic<u32> stage_b_tid{0};
     std::jthread thread;
 };

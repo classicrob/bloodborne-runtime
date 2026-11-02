@@ -134,6 +134,11 @@ void Liverpool::Process(std::stop_token stoken) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
 #endif
+#ifdef __APPLE__
+    // macOS has no per-thread CPU clock id: the Mach port, read with thread_info (BB_FRAME_LOG's
+    // stage_a_cpu_ms, the frame-stats stall lines).
+    BbStats::gpu_thread_mach.store(pthread_mach_thread_np(pthread_self()));
+#endif
     gpu_id = std::this_thread::get_id();
     gpu_tid = static_cast<u32>(bb_gettid());
 
@@ -221,7 +226,12 @@ void Liverpool::Process(std::stop_token stoken) {
                 last_decoded = task.address();
                 BbTimeline::Note(BbTimeline::DecodeBegin, curr_qid, decoded_total);
             }
+            const auto resumed = std::chrono::steady_clock::now();
             task.resume();
+            BbStats::decode_wall_ns.fetch_add(
+                u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - resumed).count()),
+                std::memory_order_relaxed);
 
             if (task.done()) {
                 task.destroy();
