@@ -1314,7 +1314,11 @@ void Rasterizer::NotePendingRead(VAddr address, u64 size) {
     }
 }
 
-void Rasterizer::WaitForPendingReads(VAddr address, u64 size) {
+bool Rasterizer::ImageOverlaps(VAddr address, u64 size) {
+    return texture_cache.HasImageInRange(address, size);
+}
+
+void Rasterizer::WaitForPendingReads(VAddr address, u64 size, u32 reason) {
     static const bool enabled = [] {
         const char* env = std::getenv("BB_CONSTRAM_PIPE");
         return !env || env[0] != '0';
@@ -1323,7 +1327,7 @@ void Rasterizer::WaitForPendingReads(VAddr address, u64 size) {
         return;
     }
     if (!enabled || !UseDrawPipe() || size == 0) {
-        DrainDrawPipe(DrawPipe::ReasonConstRam);
+        DrainDrawPipe(reason);
         return;
     }
     const u64 packet = std::max(untracked_reads_packet, pending_reads.Newest(address, size));
@@ -1331,7 +1335,7 @@ void Rasterizer::WaitForPendingReads(VAddr address, u64 size) {
         ++constram_waits_skipped;
         return;
     }
-    draw_pipe->WaitForPacket(packet, DrawPipe::ReasonConstRam);
+    draw_pipe->WaitForPacket(packet, reason);
 }
 
 void Rasterizer::NoteCommandWriteInOrder(VAddr addr, const void* data, u64 size) {
@@ -1549,6 +1553,21 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
                 CollectRingBindings(*stage, used_prepared, ring);
             } else {
                 untracked_reads_packet = draw_pipe->NextPacket(); // bindings not listed
+            }
+            // bbport (experiment bit 24): a compute stage's small read-only buffers are read on the
+            // recording thread itself by the copy-shader and compute-clear substitutions (the copy
+            // list, the clear value): listed so WRITE_DATA can wait for them (WaitForPendingReads)
+            // instead of draining the whole pipe.
+            if (BbToggle::Experiment(1ull << 24) && stage->sw_stage == Shader::SwStage::Compute) {
+                for (const auto& desc : stage->buffers) {
+                    if (desc.IsSpecial() || desc.is_written) {
+                        continue;
+                    }
+                    const auto sharp = desc.GetSharp(*stage);
+                    if (sharp.base_address && sharp.GetSize() <= (64u << 10)) {
+                        NotePendingRead(sharp.base_address, sharp.GetSize());
+                    }
+                }
             }
             ++num_stages;
             size += sizeof(PacketStage) +

@@ -2073,7 +2073,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                         (count + 1) * sizeof(u32),
                                                         BbToggle::PipelinedMemoryWrites, false);
                     } else {
-                        rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+                        // bbport (experiment bit 24): wait only for queued packets that read the
+                        // range (or have reads not listed), not the whole pipe: draws after the
+                        // write are still prepared with the new value (it runs here, on this
+                        // thread). Over a cached image (its refresh reads guest memory on the
+                        // recording thread) the whole pipe is still drained.
+                        const VAddr wd_address = write_data->Address<VAddr>();
+                        const u32 wd_bytes = (count - 2) * sizeof(u32);
+                        if (BbToggle::Experiment(1ull << 24) &&
+                            !rasterizer->ImageOverlaps(wd_address, wd_bytes)) {
+                            rasterizer->WaitForPendingReads(wd_address, wd_bytes,
+                                                            static_cast<u32>(opcode));
+                        } else {
+                            rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+                        }
                         RunWriteData(*rasterizer, reinterpret_cast<const u8*>(header));
                     }
                     if (queued) {

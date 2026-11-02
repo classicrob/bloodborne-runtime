@@ -122,7 +122,9 @@ public:
     /// bbport (stage A, BB_CONSTRAM_PIPE, default on): before the command processor writes guest
     /// memory with the CPU (a constant RAM dump), waits until the recording thread has run the
     /// queued packets that read those bytes (their buffer bindings, DMA), not all of them.
-    void WaitForPendingReads(VAddr address, u64 size);
+    void WaitForPendingReads(VAddr address, u64 size, u32 reason = DrawPipe::ReasonConstRam);
+    /// bbport (experiment bit 24): does a cached image overlap the range (locked).
+    [[nodiscard]] bool ImageOverlaps(VAddr address, u64 size);
     /// NoteCommandWrite for a write made on stage A: handed to the recording thread in order (a copy
     /// of the bytes) instead of draining it first.
     void NoteCommandWriteInOrder(VAddr addr, const void* data, u64 size);

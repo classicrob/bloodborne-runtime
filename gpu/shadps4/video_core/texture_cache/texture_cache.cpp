@@ -841,6 +841,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     return image_id;
 }
 
+bool TextureCache::HasImageInRange(VAddr address, size_t size) {
+    std::scoped_lock lock{mutex};
+    bool found = false;
+    ForEachImageInRegion(address, size, [&](ImageId, Image&) { found = true; });
+    return found;
+}
+
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
     ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
