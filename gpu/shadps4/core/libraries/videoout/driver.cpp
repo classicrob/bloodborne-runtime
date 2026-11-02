@@ -548,7 +548,8 @@ void VideoOutDriver::Flip(const Request& req) {
                                    "refresh_ms,write_fault_ms,read_faults,guest_copy_mb,draws,"
                                    "dispatches,submissions,compiles,preupload_mb,kernel_ms,alloc_mb,"
                                    "free_mb,stage_b_cpu_ms,decode_wall_ms,drain_wait_ms,ring_wait_ms,stage_b_busy_ms,"
-                                   "wake_posts,wake_latency_ms\n");
+                                   "wake_posts,wake_latency_ms,drain_waits,drain_yields,handover_ms,handover_max_us,"
+                                   "slow_handovers,stage_b_gap_ms\n");
             }
             return file;
         }();
@@ -556,7 +557,7 @@ void VideoOutDriver::Flip(const Request& req) {
             static const auto log_start = now;
             static u64 log_twf, log_tick, log_present, log_compiles, log_rf, log_preupload;
             static u64 log_alloc, log_free, log_stage_b, log_decode, log_drain, log_space, log_busy, log_posts,
-                log_wake;
+                log_wake, log_waits, log_yields, log_handover, log_slow, log_gap;
             u64 stage_b_ns = 0;
 #ifdef __APPLE__
             if (const unsigned port = BbStats::draw_rec_mach.load(); port != 0) {
@@ -581,7 +582,8 @@ void VideoOutDriver::Flip(const Request& req) {
             };
             std::fprintf(frame_log,
                          "%.4f,%.2f,%.2f,%.2f,%.2f,%llu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,"
-                         "%.2f,%llu,%llu,%llu,%llu,%.2f,%.2f,%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%.3f\n",
+                         "%.2f,%llu,%llu,%llu,%llu,%.2f,%.2f,%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%.3f,%llu,%llu,"
+                         "%.3f,%.1f,%llu,%.3f\n",
                          std::chrono::duration<double>(now - log_start).count(), frame_ms,
                          delta(present, log_present) / 1e6, delta(tick, log_tick) / 1e6,
                          last_gpu_ns ? (gpu_ns - last_gpu_ns) / 1e6 : 0.0,
@@ -606,7 +608,13 @@ void VideoOutDriver::Flip(const Request& req) {
                          delta(BbStats::pipe_space_ticks.load(), log_space) / 2.4e6,
                          delta(BbStats::pipe_busy_ticks.load(), log_busy) / 2.4e6,
                          static_cast<unsigned long long>(delta(BbStats::pipe_wake_posts.load(), log_posts)),
-                         delta(BbStats::pipe_wake_ticks.load(), log_wake) / 2.4e6);
+                         delta(BbStats::pipe_wake_ticks.load(), log_wake) / 2.4e6,
+                         static_cast<unsigned long long>(delta(BbStats::pipe_drain_waits.load(), log_waits)),
+                         static_cast<unsigned long long>(delta(BbStats::pipe_drain_yields.load(), log_yields)),
+                         delta(BbStats::pipe_handover_ticks.load(), log_handover) / 2.4e6,
+                         BbStats::pipe_handover_max_ticks.exchange(0) / 2.4e3,
+                         static_cast<unsigned long long>(delta(BbStats::pipe_slow_handovers.load(), log_slow)),
+                         delta(BbStats::pipe_gap_ticks.load(), log_gap) / 2.4e6);
             static u32 unflushed = 0;
             if (++unflushed >= 120) {
                 std::fflush(frame_log);
