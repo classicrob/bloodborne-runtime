@@ -1387,6 +1387,31 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::CommandWriteTarget(VAd
     return std::pair<const Buffer*, u64>{arena, arena->Offset(device_addr)};
 }
 
+bool BufferCache::CommandWriteTargetPossible(VAddr device_addr, u32 size) const {
+    if (!GuestInPlace() || size == 0) {
+        return false;
+    }
+    if (LayerMode()) {
+        return true;
+    }
+    // A block is bound in place only where it is direct memory in a chunk of the game's memory
+    // (BindInPlace and the moves back from VRAM), after any_in_place is set. Both hold for a
+    // range CommandWriteTarget can find; the runtime's mappings are read under its own lock.
+    if (!any_in_place.load(std::memory_order_acquire)) {
+        return false;
+    }
+    for (VAddr address = device_addr; address < device_addr + size;) {
+        u64 phys = 0;
+        uintptr_t mapping_end = 0;
+        if (runtime_memory_direct_phys(address, &phys, &mapping_end) &&
+            BbGuestMemory::Find(phys) != nullptr) {
+            return true;
+        }
+        address = ((address >> block_shift) + 1) << block_shift;
+    }
+    return false;
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
     // bbport UnifiedGuestMemory: texture data is read by the GPU where it is.
     if (UnifiedGuestMemory()) {
@@ -2119,6 +2144,7 @@ void BufferCache::BindInPlace(u64 start, u64 end, std::vector<ResidentBind>& out
             continue;
         }
         out.push_back({block, block + run, chunk->memory, phys - chunk->phys});
+        any_in_place.store(true, std::memory_order_release);
         in_place_blocks.Add({block, block + run});
         in_place_bytes.fetch_add(run << block_shift, std::memory_order_relaxed);
         block += run;
@@ -2247,6 +2273,7 @@ void BufferCache::ProcessDemotions() {
         }
         resident_ranges.Subtract(block, block + 1);
         resident_ranges.Add(backing);
+        any_in_place.store(true, std::memory_order_release);
         in_place_blocks.Add({block, block + 1});
         // Every arena over it: one replaced by a wider one (GetArena) still serves the shaders
         // whose device addresses (the BDA page table) were taken from it.
@@ -2768,6 +2795,7 @@ void BufferCache::QueueCopyBacks(u64 submitted) {
         backing.offset = (phys - chunk->phys) >> block_shift;
         resident_ranges.Subtract(block, block + 1);
         resident_ranges.Add(backing);
+        any_in_place.store(true, std::memory_order_release);
         in_place_blocks.Add({block, block + 1});
         for (const auto& covering : arenas) {
             if (covering.cpu_addr <= address && address - covering.cpu_addr < covering.size_bytes) {

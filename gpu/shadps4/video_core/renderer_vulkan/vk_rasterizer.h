@@ -213,6 +213,9 @@ public:
     /// recorded before it). Values of up to 8 bytes are registered for WAIT_REG_MEM until the GPU
     /// has written them. False: not in place (or BB_GPU_COMMAND_WRITES=0), the caller stores it.
     bool WriteDataOnGpu(VAddr address, const void* data, u32 size);
+    /// bbport (experiment bit 24, stage A while the recording thread runs): false when
+    /// WriteDataOnGpu certainly stores with the CPU (records nothing for the GPU).
+    [[nodiscard]] bool WriteDataMayUseGpu(VAddr address, u32 size) const;
     /// bbport BB_GUEST_IN_PLACE (in stream order: the recording thread): an end-of-pipe label
     /// (EVENT_WRITE_EOP/EOS) written by the GPU itself once the work recorded before it is done,
     /// as the command processor does: a buffer marker into the game's memory, where the CPU sees

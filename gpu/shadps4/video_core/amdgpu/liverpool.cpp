@@ -2077,10 +2077,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         // range (or have reads not listed), not the whole pipe: draws after the
                         // write are still prepared with the new value (it runs here, on this
                         // thread). Over a cached image (its refresh reads guest memory on the
-                        // recording thread) the whole pipe is still drained.
+                        // recording thread) the whole pipe is still drained, and where the write
+                        // may be made on the GPU (WriteDataOnGpu records it: the recording thread
+                        // must be idle, and the write lands after all queued work).
                         const VAddr wd_address = write_data->Address<VAddr>();
                         const u32 wd_bytes = (count - 2) * sizeof(u32);
                         if (BbToggle::Experiment(1ull << 24) &&
+                            !rasterizer->WriteDataMayUseGpu(wd_address, wd_bytes) &&
                             !rasterizer->ImageOverlaps(wd_address, wd_bytes)) {
                             rasterizer->WaitForPendingReads(wd_address, wd_bytes,
                                                             static_cast<u32>(opcode));

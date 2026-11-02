@@ -361,12 +361,21 @@ bool Rasterizer::WriteGuestMemory(VAddr address, const void* data, u32 size) {
     return true;
 }
 
-bool Rasterizer::WriteDataOnGpu(VAddr address, const void* data, u32 size) {
+static bool GpuCommandWrites() {
     static const bool enabled = [] {
         const char* env = std::getenv("BB_GPU_COMMAND_WRITES");
         return !env || env[0] != '0';
     }();
-    if (!enabled || !VideoCore::GuestInPlace() || size == 0 || (address | size) % 4 != 0) {
+    return enabled;
+}
+
+bool Rasterizer::WriteDataMayUseGpu(VAddr address, u32 size) const {
+    return GpuCommandWrites() && VideoCore::GuestInPlace() && size != 0 &&
+           (address | size) % 4 == 0 && buffer_cache.CommandWriteTargetPossible(address, size);
+}
+
+bool Rasterizer::WriteDataOnGpu(VAddr address, const void* data, u32 size) {
+    if (!GpuCommandWrites() || !VideoCore::GuestInPlace() || size == 0 || (address | size) % 4 != 0) {
         return false;
     }
     // bbport BB_LAYER_MEMORY: a range whole in a mirror is written there too (asked first: the
@@ -380,6 +389,10 @@ bool Rasterizer::WriteDataOnGpu(VAddr address, const void* data, u32 size) {
         runtime.UpdateBuffer(mirror->first, mirror->second, {static_cast<const u8*>(data), size});
     }
     runtime.UpdateBuffer(target->first, target->second, {static_cast<const u8*>(data), size});
+    static std::atomic<bool> reported{false};
+    if (BbToggle::Experiment(1ull << 24) && !reported.exchange(true, std::memory_order_relaxed)) {
+        std::printf("GPU: a WRITE_DATA written on the GPU, in place (experiment bit 24: drained)\n");
+    }
     if (size <= sizeof(u64) && HonestLabels()) {
         u64 value = 0;
         std::memcpy(&value, data, size);
@@ -1553,21 +1566,6 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
                 CollectRingBindings(*stage, used_prepared, ring);
             } else {
                 untracked_reads_packet = draw_pipe->NextPacket(); // bindings not listed
-            }
-            // bbport (experiment bit 24): a compute stage's small read-only buffers are read on the
-            // recording thread itself by the copy-shader and compute-clear substitutions (the copy
-            // list, the clear value): listed so WRITE_DATA can wait for them (WaitForPendingReads)
-            // instead of draining the whole pipe.
-            if (BbToggle::Experiment(1ull << 24) && stage->sw_stage == Shader::SwStage::Compute) {
-                for (const auto& desc : stage->buffers) {
-                    if (desc.IsSpecial() || desc.is_written) {
-                        continue;
-                    }
-                    const auto sharp = desc.GetSharp(*stage);
-                    if (sharp.base_address && sharp.GetSize() <= (64u << 10)) {
-                        NotePendingRead(sharp.base_address, sharp.GetSize());
-                    }
-                }
             }
             ++num_stages;
             size += sizeof(PacketStage) +
