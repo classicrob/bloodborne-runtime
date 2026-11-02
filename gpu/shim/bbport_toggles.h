@@ -139,7 +139,10 @@ inline std::atomic<unsigned> gpu_thread_mach{0};
 inline std::atomic<unsigned> draw_rec_mach{0};
 /// BB_FRAME_LOG: stage A's wall time inside decoding (ns), and its spin waits on the draw pipe
 /// (__rdtsc ticks: drains for stage B, and room in the ring).
-inline std::atomic<std::uint64_t> decode_wall_ns{0}, pipe_drain_ticks{0}, pipe_space_ticks{0}; ///< macOS: the GPU command thread's Mach port (its CPU time)
+inline std::atomic<std::uint64_t> decode_wall_ns{0}, pipe_drain_ticks{0}, pipe_space_ticks{0};
+/// BB_FRAME_LOG: stage B's wall time running packets (__rdtsc ticks), packets posted while it slept,
+/// and the time from such a post to stage B running again (ticks).
+inline std::atomic<std::uint64_t> pipe_busy_ticks{0}, pipe_wake_posts{0}, pipe_wake_ticks{0}; ///< macOS: the GPU command thread's Mach port (its CPU time)
 inline std::atomic<std::uint64_t> draws{0}, dispatches{0}, submissions{0};
 /// Frames the GPU command thread has started (display pass), for per-frame diagnostics.
 inline std::atomic<std::uint64_t> gpu_frames{0};

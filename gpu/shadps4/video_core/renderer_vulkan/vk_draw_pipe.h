@@ -92,6 +92,9 @@ public:
         published.store(head, std::memory_order_seq_cst);
         ++packets;
         if (sleeping.load(std::memory_order_seq_cst)) {
+            // BB_FRAME_LOG: a post to a sleeping stage B, timed until it runs again (wake_latency_ms).
+            BbStats::pipe_wake_posts.fetch_add(1, std::memory_order_relaxed);
+            wake_posted.store(__rdtsc(), std::memory_order_relaxed);
             wake.fetch_add(1, std::memory_order_seq_cst);
             wake.notify_one();
         }
@@ -244,6 +247,10 @@ private:
                         if (published.load(std::memory_order_seq_cst) == at &&
                             !stop.stop_requested()) {
                             wake.wait(seen, std::memory_order_seq_cst);
+                            if (const u64 posted = wake_posted.exchange(0, std::memory_order_relaxed)) {
+                                BbStats::pipe_wake_ticks.fetch_add(__rdtsc() - posted,
+                                                                   std::memory_order_relaxed);
+                            }
                         }
                         sleeping.store(false, std::memory_order_relaxed);
                     }
@@ -258,7 +265,9 @@ private:
             }
             const u64 start = __rdtsc();
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
-            busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
+            const u64 ran = __rdtsc() - start;
+            busy_cycles.fetch_add(ran, std::memory_order_relaxed);
+            BbStats::pipe_busy_ticks.fetch_add(ran, std::memory_order_relaxed);
             at += header->size;
             consumed_packets.fetch_add(1, std::memory_order_release);
             consumed.store(at, std::memory_order_release);
@@ -276,6 +285,7 @@ private:
     std::atomic<u64> consumed_packets{0}; ///< packets stage B has run (NextPacket numbers)
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
+    std::atomic<u64> wake_posted{0}; ///< __rdtsc of the last post to a sleeping stage B (statistics)
     std::atomic<u32> stage_b_tid{0};
     std::jthread thread;
 };
