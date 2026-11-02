@@ -1315,6 +1315,16 @@ void Rasterizer::NotePendingRead(VAddr address, u64 size) {
     }
 }
 
+u32 Rasterizer::PendingReadState(VAddr address, u64 size) const {
+    if (!draw_pipe) {
+        return 0;
+    }
+    if (!draw_pipe->ReachedPacket(pending_reads.Newest(address, size))) {
+        return 1;
+    }
+    return draw_pipe->ReachedPacket(untracked_reads_packet) ? 0 : 2;
+}
+
 void Rasterizer::WaitForPendingReads(VAddr address, u64 size) {
     static const bool enabled = [] {
         const char* env = std::getenv("BB_CONSTRAM_PIPE");

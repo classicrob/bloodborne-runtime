@@ -186,6 +186,10 @@ public:
     void NotePendingGpuWrite(VAddr address, u64 size);
     /// Stage A: guest memory the recording thread will read for the next packet (buffer bindings).
     void NotePendingRead(VAddr address, u64 size);
+    /// bbport BB_WRITEDATA_STATS (diagnostics): 0 when every queued packet reading [address,
+    /// address+size) has been recorded (a write there could skip the draw pipe drain), 1 when a
+    /// tracked read of the range is still queued, 2 when only an untracked read is.
+    [[nodiscard]] u32 PendingReadState(VAddr address, u64 size) const;
     /// Before a guest-visible write: fences deferred earlier are written first.
     void WaitDeferredSignals() {
         recorder.WaitDeferredSignals();

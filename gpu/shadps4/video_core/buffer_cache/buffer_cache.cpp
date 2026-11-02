@@ -13,6 +13,7 @@
 #include <bit>
 #include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
+#include "shader_recompiler/ir/passes/srt.h"
 #include "bbport_copy.h"
 #include "bbport_toggles.h"
 #include "bbport_sections.h"
@@ -1164,6 +1165,10 @@ void PrintBufferStats() {
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
     BB_SECTION(ObtainBuffer);
+    if (Shader::StaleRangeCheckOn()) [[unlikely]] {
+        Shader::NoteStaleRangeAccess(is_written ? "buffer bind (written)" : "buffer bind (read)",
+                                     device_addr, size);
+    }
     const bool stats = BufferStatsEnabled();
     if (stats) {
         PrintBufferStats();
@@ -3418,6 +3423,7 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, u64 arena_offs
         miss = {device_addr, size, generation};
         return false;
     }
+    Shader::NoteStaleRangeAccess("image write-back for a buffer read", device_addr, size);
     // bbport experiment bit 20 (MEASUREMENT ONLY, changes the picture): the image is not written
     // back into the game's memory for a buffer that reads it, to size what the round trips cost.
     if (BbToggle::Experiment(1ull << 20)) {

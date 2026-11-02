@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "shader_recompiler/ir/passes/srt.h"
 #include "bbport_toggles.h"
 #include "bbport_button_prompts.h"
 #include "bbport_free_check.h"
@@ -199,6 +200,8 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
+    Shader::NoteStaleRangeAccess("image downloaded to guest memory", image.info.guest_address,
+                                 image.info.guest_size);
     // bbport BB_IMAGE_DOWNLOAD_LOG=1 (diagnostics): each image downloaded to guest memory, once
     // per address (size, format, tiling, flags), and every 5 s how many downloads there were.
     static const bool download_log = [] {
@@ -312,6 +315,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 }
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
+    Shader::NoteStaleRangeAccess("CPU write over cached images", addr, size);
     std::scoped_lock lock{mutex};
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
@@ -831,6 +835,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // Create and register a new image
     if (!image_id) {
         image_id = slot_images.insert(device, runtime, slot_image_views, info);
+        Shader::NoteStaleRangeAccess("image created", info.guest_address, info.guest_size);
         // bbport: a texture first bound as storage or in another pixel format gets those usages
         // now rather than an upgrade copy at its first view (lazy texture usages).
         if (auto& created = slot_images[image_id]; created.NeededUsage(desc.view_info)) {

@@ -39,6 +39,9 @@ bool UsePortableSrtWalker();
 bool StaleRangeCheckOn();
 void NoteUnwrittenRange(u64 base, u64 size);
 void CheckWalkerLoad(const void* address, u32 size);
+/// Any other access by the renderer to such a range (buffer bind, image write-back, image
+/// creation, CPU write seen by the caches): counted and logged per site.
+void NoteStaleRangeAccess(const char* site, u64 address, u64 size);
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
 
 /// Run x86 code natively, translated x86 code on arm64, or a portable SRT program.

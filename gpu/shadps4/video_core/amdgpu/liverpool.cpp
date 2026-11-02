@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <unordered_set>
 #include <cstdlib>
 #include <thread>
 #include <pthread.h>
@@ -619,6 +620,10 @@ void RunGpuClockCopy(Vulkan::Rasterizer& rasterizer, const u8* data) {
         std::memcpy(reinterpret_cast<void*>(target), &value, sizeof(value));
     }
 }
+
+// bbport BB_WRITEDATA_STATS (diagnostics): addresses the guest polls with WAIT_REG_MEM, to tell the
+// WRITE_DATAs that are labels the game waits on from plain data writes (GPU command thread only).
+std::unordered_set<u64> wait_reg_mem_addresses;
 
 void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* header = reinterpret_cast<const PM4Header*>(data);
@@ -2073,6 +2078,63 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                         (count + 1) * sizeof(u32),
                                                         BbToggle::PipelinedMemoryWrites, false);
                     } else {
+                        // bbport BB_WRITEDATA_STATS=1 (diagnostics): would this write have to
+                        // wait for queued draws reading its range, or only for the whole pipe?
+                        static const bool wd_stats = std::getenv("BB_WRITEDATA_STATS") != nullptr;
+                        if (wd_stats) {
+                            static std::array<u64, 3> states{};
+                            static u64 in_place = 0, total = 0, bytes = 0;
+                            // by size: 4-8 bytes (label-sized), 12-64, over 64
+                            static std::array<u64, 3> sizes{}, size_unwaited{};
+                            static auto last = std::chrono::steady_clock::now();
+                            const u32 wd_bytes = (count - 2) * sizeof(u32);
+                            const u32 size_class = wd_bytes <= 8 ? 0 : wd_bytes <= 64 ? 1 : 2;
+                            const u32 state = rasterizer->PendingReadState(
+                                write_data->Address<VAddr>(), wd_bytes);
+                            ++states[state];
+                            ++sizes[size_class];
+                            size_unwaited[size_class] += state == 0 ? 1 : 0;
+                            static u64 polled = 0, polled_unwaited = 0;
+                            bool is_polled = false;
+                            for (u64 a = write_data->Address<u64>() & ~u64{7};
+                                 a < write_data->Address<u64>() + wd_bytes; a += 8) {
+                                is_polled |= wait_reg_mem_addresses.contains(a);
+                            }
+                            polled += is_polled ? 1 : 0;
+                            polled_unwaited += is_polled && state == 0 ? 1 : 0;
+                            ++total;
+                            bytes += (count - 2) * sizeof(u32);
+                            in_place += VideoCore::GuestInPlace() ? 1 : 0;
+                            if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
+                                last = std::chrono::steady_clock::now();
+                                std::printf("WriteData stats (5 s): %llu writes, %llu bytes; queued "
+                                            "readers of the range all recorded %llu, a tracked "
+                                            "reader still queued %llu, only an untracked one %llu; "
+                                            "guest memory in place %llu\n",
+                                            (unsigned long long)total, (unsigned long long)bytes,
+                                            (unsigned long long)states[0],
+                                            (unsigned long long)states[1],
+                                            (unsigned long long)states[2],
+                                            (unsigned long long)in_place);
+                                std::printf("WriteData sizes (5 s): 4-8 bytes %llu (%llu unwaited), "
+                                            "12-64 bytes %llu (%llu), over 64 bytes %llu (%llu)\n",
+                                            (unsigned long long)sizes[0],
+                                            (unsigned long long)size_unwaited[0],
+                                            (unsigned long long)sizes[1],
+                                            (unsigned long long)size_unwaited[1],
+                                            (unsigned long long)sizes[2],
+                                            (unsigned long long)size_unwaited[2]);
+                                std::printf("WriteData to addresses the game polls (WAIT_REG_MEM): "
+                                            "%llu (%llu unwaited)\n",
+                                            (unsigned long long)polled,
+                                            (unsigned long long)polled_unwaited);
+                                polled = polled_unwaited = 0;
+                                states = {};
+                                sizes = {};
+                                size_unwaited = {};
+                                in_place = total = bytes = 0;
+                            }
+                        }
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                         RunWriteData(*rasterizer, reinterpret_cast<const u8*>(header));
                     }
@@ -2229,6 +2291,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
+                static const bool wd_poll_stats = std::getenv("BB_WRITEDATA_STATS") != nullptr;
+                if (wd_poll_stats) {
+                    wait_reg_mem_addresses.insert(reinterpret_cast<u64>(wait_addr) & ~u64{7});
+                }
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
                     if (rasterizer) {

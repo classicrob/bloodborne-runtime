@@ -6,6 +6,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <mutex>
 #include <queue>
 #include <unordered_map>
 #include <vector>
@@ -317,6 +319,32 @@ void CheckWalkerLoad(const void* address, u32 size) {
             }
             return;
         }
+    }
+}
+
+void NoteStaleRangeAccess(const char* site, u64 address, u64 size) {
+    if (!StaleRangeCheckOn() || size == 0) {
+        return;
+    }
+    const u32 n = std::min<u32>(unwritten_count.load(std::memory_order_acquire),
+                                unwritten_ranges.size());
+    for (u32 i = 0; i < n; ++i) {
+        const u64 base = unwritten_ranges[i].base.load(std::memory_order_acquire);
+        const u64 range = unwritten_ranges[i].size.load(std::memory_order_relaxed);
+        if (!base || address + size <= base || address >= base + range) {
+            continue;
+        }
+        static std::mutex mutex;
+        static std::unordered_map<std::string, u64> counts;
+        std::scoped_lock lock{mutex};
+        const u64 c = ++counts[site];
+        if (c <= 10 || c % 4096 == 0) {
+            std::printf("Stale range check: %s %#llx+%#llx overlaps range %u (%#llx+%#llx), %llu "
+                        "at this site\n",
+                        site, (unsigned long long)address, (unsigned long long)size, i,
+                        (unsigned long long)base, (unsigned long long)range, (unsigned long long)c);
+        }
+        return;
     }
 }
 
