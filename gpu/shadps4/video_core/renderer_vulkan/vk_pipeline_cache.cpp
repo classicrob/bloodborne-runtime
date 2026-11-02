@@ -777,7 +777,8 @@ bool RectsAsTriangles() {
 /// has (seen: data/number format 6/1, 6/5, 9/7) fails the worker's preparation, and the GPU
 /// thread selects that draw itself when it gets there (SurfaceFormat asserted on the worker and
 /// stopped the game). The GPU thread checks the formats of every prepared key it uses
-/// (PreparedVertexFormatsMatch).
+/// (PreparedVertexFormatsMatch). Unlike SurfaceFormat no other number format is tried, so a draw
+/// whose format exists only that way is always selected on the GPU thread.
 static std::optional<VideoCore::Backend::Format> VertexFormat(const PipelineSelection& sel,
                                                               const AmdGpu::Buffer& buffer) {
     if (!sel.worker) {
@@ -1320,6 +1321,8 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     if (vs_info && sel.fetch_shader && !device.GetCapabilities().dynamic_vertex_input) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
+        // bbport: one format per fetch attribute, none skipped: PreparedVertexFormatsMatch
+        // compares format i with attribute i.
         u32 vertex_binding = 0;
         for (const auto& attrib : sel.fetch_shader->attributes) {
             const auto& buffer = attrib.GetSharp(*vs_info);
