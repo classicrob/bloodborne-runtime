@@ -540,3 +540,12 @@ elseif (BB_NET)
         message(STATUS "Online module: off (protobuf, nlohmann_json, OpenSSL, zlib or miniupnpc missing)")
     endif()
 endif()
+
+
+add_executable(buffer-read-extent-test EXCLUDE_FROM_ALL ../tests/test_buffer_read_extent.cpp)
+target_include_directories(buffer-read-extent-test PRIVATE shadps4)
+target_compile_options(buffer-read-extent-test PRIVATE -UNDEBUG)
+if (BUILD_TESTING)
+    add_test(NAME buffer-read-extent-test COMMAND buffer-read-extent-test)
+    add_dependencies(bbgpu-tests buffer-read-extent-test)
+endif()
