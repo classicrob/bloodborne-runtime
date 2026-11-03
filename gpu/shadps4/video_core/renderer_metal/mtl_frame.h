@@ -22,6 +22,10 @@
 #include <vulkan/vulkan_metal.h>
 #include "common/types.h"
 
+namespace MetalGpuTiming {
+struct Command;
+}
+
 namespace MetalShadow {
 struct GraphicsEntry;
 }
@@ -76,6 +80,7 @@ struct Owned {
     id<MTLComputeCommandEncoder> compute;
     id<MTLBlitCommandEncoder> blit;
     unsigned commands{};
+    MetalGpuTiming::Command* timing{}; ///< BB_METAL_GPU_TIMING: this command buffer's samples
 
     // Render pass (vkCmdBeginRendering .. vkCmdEndRendering). `pass` reopens it (loading, not
     // clearing) after work that had to interrupt it (tessellation kernels).

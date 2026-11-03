@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "bbport_frame_rate.h"
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -452,6 +455,17 @@ void VideoOutDriver::Flip(const Request& req) {
             clock_gettime(static_cast<clockid_t>(clock), &ts);
             gpu_ns = u64(ts.tv_sec) * 1000000000ull + u64(ts.tv_nsec);
         }
+#ifdef __APPLE__
+        if (const unsigned port = BbStats::gpu_thread_mach.load(); port != 0) {
+            thread_basic_info_data_t info{};
+            mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(port, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) ==
+                KERN_SUCCESS) {
+                gpu_ns = (u64(info.user_time.seconds) + u64(info.system_time.seconds)) * 1000000000ull +
+                         (u64(info.user_time.microseconds) + u64(info.system_time.microseconds)) * 1000ull;
+            }
+        }
+#endif
         const u64 images = BbStats::images_registered.load();
         const u64 image_bytes = BbStats::image_upload_bytes.load();
         const u64 buffer_bytes = BbStats::buffer_upload_bytes.load();
@@ -533,14 +547,31 @@ void VideoOutDriver::Flip(const Request& req) {
                                    "images,image_mb,buffer_mb,protect_ms,resident_ms,create_ms,"
                                    "refresh_ms,write_fault_ms,read_faults,guest_copy_mb,draws,"
                                    "dispatches,submissions,compiles,preupload_mb,kernel_ms,alloc_mb,"
-                                   "free_mb\n");
+                                   "free_mb,stage_b_cpu_ms,decode_wall_ms,drain_wait_ms,ring_wait_ms,stage_b_busy_ms,"
+                                   "wake_posts,wake_latency_ms,drain_waits,drain_yields,handover_ms,handover_max_us,"
+                                   "slow_handovers,stage_b_gap_ms\n");
             }
             return file;
         }();
         if (frame_log) {
             static const auto log_start = now;
             static u64 log_twf, log_tick, log_present, log_compiles, log_rf, log_preupload;
-            static u64 log_alloc, log_free;
+            static u64 log_alloc, log_free, log_stage_b, log_decode, log_drain, log_space, log_busy, log_posts,
+                log_wake, log_waits, log_yields, log_handover, log_slow, log_gap;
+            u64 stage_b_ns = 0;
+#ifdef __APPLE__
+            if (const unsigned port = BbStats::draw_rec_mach.load(); port != 0) {
+                thread_basic_info_data_t info{};
+                mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+                if (thread_info(port, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info),
+                                &count) == KERN_SUCCESS) {
+                    stage_b_ns = (u64(info.user_time.seconds) + u64(info.system_time.seconds)) *
+                                     1000000000ull +
+                                 (u64(info.user_time.microseconds) + u64(info.system_time.microseconds)) *
+                                     1000ull;
+                }
+            }
+#endif
             const u64 tick = BbStats::tick_wait_ns.load(), present = BbStats::present_wait_ns.load();
             const u64 compiles_now = Vulkan::g_bb_compiles.load();
             // tick_wait_ns and the compile count are reset every stats window.
@@ -551,7 +582,8 @@ void VideoOutDriver::Flip(const Request& req) {
             };
             std::fprintf(frame_log,
                          "%.4f,%.2f,%.2f,%.2f,%.2f,%llu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,"
-                         "%.2f,%llu,%llu,%llu,%llu,%.2f,%.2f,%.1f,%.1f\n",
+                         "%.2f,%llu,%llu,%llu,%llu,%.2f,%.2f,%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%.3f,%llu,%llu,"
+                         "%.3f,%.1f,%llu,%.3f\n",
                          std::chrono::duration<double>(now - log_start).count(), frame_ms,
                          delta(present, log_present) / 1e6, delta(tick, log_tick) / 1e6,
                          last_gpu_ns ? (gpu_ns - last_gpu_ns) / 1e6 : 0.0,
@@ -569,7 +601,20 @@ void VideoOutDriver::Flip(const Request& req) {
                          delta(BbStats::preupload_bytes.load(), log_preupload) / 1e6,
                          last_gpu_ns ? (sys_us - last_sys) / 1e3 : 0.0,
                          delta(BbStats::device_alloc_bytes.load(), log_alloc) / 1e6,
-                         delta(BbStats::device_free_bytes.load(), log_free) / 1e6);
+                         delta(BbStats::device_free_bytes.load(), log_free) / 1e6,
+                         delta(stage_b_ns, log_stage_b) / 1e6,
+                         delta(BbStats::decode_wall_ns.load(), log_decode) / 1e6,
+                         delta(BbStats::pipe_drain_ticks.load(), log_drain) / 2.4e6,
+                         delta(BbStats::pipe_space_ticks.load(), log_space) / 2.4e6,
+                         delta(BbStats::pipe_busy_ticks.load(), log_busy) / 2.4e6,
+                         static_cast<unsigned long long>(delta(BbStats::pipe_wake_posts.load(), log_posts)),
+                         delta(BbStats::pipe_wake_ticks.load(), log_wake) / 2.4e6,
+                         static_cast<unsigned long long>(delta(BbStats::pipe_drain_waits.load(), log_waits)),
+                         static_cast<unsigned long long>(delta(BbStats::pipe_drain_yields.load(), log_yields)),
+                         delta(BbStats::pipe_handover_ticks.load(), log_handover) / 2.4e6,
+                         BbStats::pipe_handover_max_ticks.exchange(0) / 2.4e3,
+                         static_cast<unsigned long long>(delta(BbStats::pipe_slow_handovers.load(), log_slow)),
+                         delta(BbStats::pipe_gap_ticks.load(), log_gap) / 2.4e6);
             static u32 unflushed = 0;
             if (++unflushed >= 120) {
                 std::fflush(frame_log);
