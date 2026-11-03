@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Zlib
 
 #include <bit>
+#include <cstdlib>
 #include "video_core/renderer_vulkan/vk_barrier_tracker.h"
 
 namespace Vulkan {
@@ -15,6 +16,10 @@ BarrierTracker::BarrierTracker() {
     for (u32 i = 0; i < 2u * HashTableSize; i++) {
         AllocateNode();
     }
+
+    // bbport: see SetMergeTouching.
+    const char* env = std::getenv("BB_TRACKER_MERGE_TOUCHING");
+    merge_touching = env && env[0] == '1';
 }
 
 bool BarrierTracker::FindRange(const AddressRange& range, Access access_type) const {
@@ -26,7 +31,7 @@ bool BarrierTracker::FindRange(const AddressRange& range, Access access_type) co
 void BarrierTracker::InsertRange(const AddressRange& range, Access access_type) {
     // If we can just insert the node with no conflicts, we don't have to do anything.
     u32 root_index = ComputeRootIndex(range, access_type);
-    u32 node_index = InsertNode(range, root_index);
+    u32 node_index = InsertNode(range, root_index, merge_touching);
 
     if (!node_index) [[likely]] {
         return;
@@ -78,7 +83,8 @@ void BarrierTracker::InsertRange(const AddressRange& range, Access access_type) 
         RemoveNode(node_index, root_index);
         node_index = FindNode(range, root_index);
     }
-    InsertNode(merged_range, root_index);
+    // Touching neighbours may stay separate here: the merged range must be inserted.
+    InsertNode(merged_range, root_index, false);
 }
 
 void BarrierTracker::Clear() {
@@ -141,7 +147,7 @@ u32 BarrierTracker::FindNode(const AddressRange& range, u32 root_index) const {
     return 0;
 }
 
-u32 BarrierTracker::InsertNode(const AddressRange& range, u32 root_index) {
+u32 BarrierTracker::InsertNode(const AddressRange& range, u32 root_index, bool merge_touching) {
     // Check if the given root is valid at all
     const u64 root_bit = 1ULL << (root_index - 1);
 
@@ -155,12 +161,15 @@ u32 BarrierTracker::InsertNode(const AddressRange& range, u32 root_index) {
     }
 
     // Traverse tree and abort if we find any range overlapping the one we're trying to insert.
+    // bbport: with merge_touching, a range that only meets it end to start counts too; an
+    // unsuccessful search passes the in-order predecessor and successor, so a neighbour is found.
     u32 parent_index = root_index;
     u32 child_index = 0;
 
     while (true) {
         auto& parent = nodes[parent_index];
-        if (parent.address_range.Overlaps(range)) {
+        if (parent.address_range.Overlaps(range) ||
+            (merge_touching && parent.address_range.Adjoins(range))) {
             return parent_index;
         }
         child_index = parent.address_range < range;

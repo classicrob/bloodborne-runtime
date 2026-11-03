@@ -549,3 +549,12 @@ if (BUILD_TESTING)
     add_test(NAME buffer-read-extent-test COMMAND buffer-read-extent-test)
     add_dependencies(bbgpu-tests buffer-read-extent-test)
 endif()
+
+add_executable(barrier-tracker-touch-test EXCLUDE_FROM_ALL ../tests/test_barrier_tracker_touch.cpp
+               shadps4/video_core/renderer_vulkan/vk_barrier_tracker.cpp)
+target_include_directories(barrier-tracker-touch-test PRIVATE shadps4)
+target_compile_options(barrier-tracker-touch-test PRIVATE -UNDEBUG)
+if (BUILD_TESTING)
+    add_test(NAME barrier-tracker-touch-test COMMAND barrier-tracker-touch-test)
+    add_dependencies(bbgpu-tests barrier-tracker-touch-test)
+endif()

@@ -29,6 +29,13 @@ struct AddressRange {
                range_start <= other.range_end;
     }
 
+    /// bbport: the ranges share no byte but meet end to start (inclusive ends).
+    bool Adjoins(const AddressRange& other) const {
+        return resource == other.resource &&
+               ((range_end != ~u64{0} && range_end + 1 == other.range_start) ||
+                (other.range_end != ~u64{0} && other.range_end + 1 == range_start));
+    }
+
     bool operator<(const AddressRange& other) const {
         return (resource < other.resource) ||
                (resource == other.resource && range_start < other.range_start);
@@ -111,11 +118,19 @@ public:
         return !root_mask_valid;
     }
 
+    /// bbport (BB_TRACKER_MERGE_TOUCHING=1): an inserted range that meets an existing range end to
+    /// start extends that node instead of adding one. The covered bytes, and so every FindRange
+    /// answer, stay the same; the trees get fewer nodes (exact read ranges of consecutive ring
+    /// allocations no longer fall inside 4 KiB pages already present).
+    void SetMergeTouching(bool merge) {
+        merge_touching = merge;
+    }
+
 private:
     u32 AllocateNode();
     void FreeNode(u32 node);
     u32 FindNode(const AddressRange& range, u32 root_index) const;
-    u32 InsertNode(const AddressRange& range, u32 root_index);
+    u32 InsertNode(const AddressRange& range, u32 root_index, bool merge_touching);
     void RemoveNode(u32 node_index, u32 root_index);
     void RebalancePostInsert(u32 node_index, u32 root_index);
     void RotateLeft(u32 node_index, u32 root_index);
@@ -128,6 +143,7 @@ private:
     }
 
 private:
+    bool merge_touching{};
     u64 root_mask_valid{};
     u64 root_mask_subtree{};
     std::vector<BarrierTreeNode> nodes;
