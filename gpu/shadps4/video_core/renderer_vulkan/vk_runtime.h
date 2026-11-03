@@ -108,6 +108,10 @@ public:
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                              const VideoCore::Buffer* buffer, u64 offset);
     void CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) override;
+    /// bbport (experiment bit 25): level 0 of one layer of `src` into one layer of `dst`, both the
+    /// same format and size.
+    void CopyImageLayer(VideoCore::Image* src, u32 src_layer, VideoCore::Image* dst,
+                        u32 dst_layer) override;
 
     void CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) override;
 
