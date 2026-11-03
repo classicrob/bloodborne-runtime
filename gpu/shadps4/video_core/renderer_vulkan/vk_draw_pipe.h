@@ -128,7 +128,7 @@ public:
             if (spins < 4096 || !DrainYields()) {
                 __builtin_ia32_pause();
             } else if (DrainSleeps()) {
-                SleepUntil([this] { return consumed.load(std::memory_order_acquire) == head; });
+                SleepUntil(packets, [this] { return consumed.load(std::memory_order_acquire) == head; });
             } else {
                 std::this_thread::yield();
             }
@@ -158,7 +158,7 @@ public:
             if (spins < 4096 || !DrainYields()) {
                 __builtin_ia32_pause();
             } else if (DrainSleeps()) {
-                SleepUntil([this, number] { return ReachedPacket(number); });
+                SleepUntil(number, [this, number] { return ReachedPacket(number); });
             } else {
                 std::this_thread::yield();
             }
@@ -226,12 +226,14 @@ private:
         return sleeps;
     }
 
-    /// Stage A: sleeps on `progress` until `done()`. `waiting` and `progress` pair with
-    /// Progressed(): either stage B sees `waiting` and notifies, or its increment comes first and
-    /// the load here sees it (seq_cst), so no wake is lost.
+    /// Stage A: sleeps on `progress` until `done()`, which holds once stage B has run packet
+    /// `target` (Drain: the last committed one, so `consumed == head` then too). `wait_target` and
+    /// `progress` pair with Progressed(): stage B wakes stage A only when its packet count reaches
+    /// the target (one wake per wait, not one per packet), and either stage B sees the target or its
+    /// progress increment comes first and the load here sees it (seq_cst), so no wake is lost.
     template <typename Done>
-    void SleepUntil(Done done) {
-        waiting.store(true, std::memory_order_seq_cst);
+    void SleepUntil(u64 target, Done done) {
+        wait_target.store(target, std::memory_order_seq_cst);
         while (true) {
             const u32 seen = progress.load(std::memory_order_seq_cst);
             if (done()) {
@@ -239,13 +241,15 @@ private:
             }
             progress.wait(seen, std::memory_order_seq_cst);
         }
-        waiting.store(false, std::memory_order_relaxed);
+        wait_target.store(NoWaiter, std::memory_order_relaxed);
     }
 
-    /// Stage B, after `consumed` (and `consumed_packets`) moved: wakes a sleeping stage A.
+    /// Stage B, after `consumed` and `consumed_packets` moved: wakes stage A when it reached the
+    /// packet stage A waits for.
     void Progressed() {
         progress.fetch_add(1, std::memory_order_seq_cst);
-        if (waiting.load(std::memory_order_seq_cst)) {
+        if (consumed_packets.load(std::memory_order_relaxed) >=
+            wait_target.load(std::memory_order_seq_cst)) {
             progress.notify_all();
         }
     }
@@ -370,7 +374,8 @@ private:
     alignas(64) std::atomic<u64> consumed{0};
     std::atomic<u64> consumed_packets{0}; ///< packets stage B has run (NextPacket numbers)
     std::atomic<u32> progress{0};     ///< bumped by stage B after each packet or wrap
-    std::atomic<bool> waiting{false}; ///< stage A sleeps on `progress` (BB_PIPE_DRAIN_WAIT)
+    static constexpr u64 NoWaiter = ~u64{0};
+    std::atomic<u64> wait_target{NoWaiter}; ///< the packet stage A sleeps for (BB_PIPE_DRAIN_WAIT)
     std::array<std::atomic<u64>, 64> packet_end{}; ///< __rdtsc when stage B ended packet n (n % 64)
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
