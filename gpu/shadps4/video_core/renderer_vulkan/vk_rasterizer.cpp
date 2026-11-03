@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <dlfcn.h>
+#include <chrono>
+#include <mutex>
+#include "shader_recompiler/buffer_read_extent.h"
 #include "bbport_metal_residency.h"
 #include <map>
 #include <unordered_set>
@@ -4334,6 +4337,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
                 needs_barrier = true;
             } else {
+                const u64 read_extent = memory->ClampRangeSize(vsharp.base_address,
+                    Shader::BufferReadExtent(
+                        vsharp.stride, vsharp.num_records, vsharp.swizzle_enable,
+                        vsharp.index_stride, vsharp.element_size, vsharp.add_tid_enable,
+                        desc.read_offset_end, false));
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
@@ -4359,12 +4367,46 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 buffer_infos.push_back(VideoCore::BindingOf(
                     *buffer, offset_aligned,
                     std::min<u64>(size + adjust, buffer->SizeBytes() - offset_aligned)));
-                bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
+                u64 read_offset = offset;
+                u64 declared_size = std::min<u64>(read_extent, buffer->SizeBytes() - offset);
+                const bool dynamic = vsharp.stride && desc.dynamic_read_offset;
+                if (dynamic) {
+                    // Retain pre-PR #11 ordering coverage for unknown offsets. This is
+                    // compatibility coverage, not a bound on arbitrary shader addresses.
+                    read_offset = Common::AlignDown(offset, u64{4096});
+                    declared_size = std::max(offset + read_extent,
+                        Common::AlignUp(offset + size, u64{4096})) - read_offset;
+                    declared_size = std::min(declared_size, buffer->SizeBytes() - read_offset);
+                }
+                static const bool count_extents = [] {
+                    const char* value = std::getenv("BB_READ_EXTENT_STATS");
+                    return value && value[0] == '1';
+                }();
+                if (count_extents) {
+                    static std::mutex extent_stats_mutex;
+                    const std::lock_guard lock(extent_stats_mutex);
+                    static u64 static_count = 0, dynamic_count = 0, bindings = 0;
+                    static auto since = std::chrono::steady_clock::now();
+                    ++bindings;
+                    if (declared_size > size) {
+                        (dynamic ? dynamic_count : static_count)++;
+                    }
+                    const auto now = std::chrono::steady_clock::now();
+                    const double seconds = std::chrono::duration<double>(now - since).count();
+                    if (seconds >= 1.0) {
+                        fprintf(stderr, "[read-extents] static=%.1f/s dynamic=%.1f/s (%llu bindings in %.3fs)\n",
+                            static_count / seconds, dynamic_count / seconds,
+                            (unsigned long long)bindings, seconds);
+                        static_count = dynamic_count = bindings = 0;
+                        since = now;
+                    }
+                }
+                bound_buffers.emplace_back(buffer, read_offset, declared_size, desc.is_written);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
-                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                needs_barrier |= runtime.IsBufferAccessed(buffer, read_offset, declared_size, desc.is_written);
             }
         }
 

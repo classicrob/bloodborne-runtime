@@ -81,6 +81,8 @@ struct BufferResource {
     BufferType buffer_type{};
     bool is_written{};
     bool is_formatted{};
+    u64 read_offset_end{};
+    bool dynamic_read_offset{};
     bool runtime_stride{}; ///< The shader reads the stride from the sharp: not part of its form.
     SharpFetchPostOp post_op{};
     u32 post_op_dw1_mask{};

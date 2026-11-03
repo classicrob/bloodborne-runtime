@@ -678,13 +678,45 @@ void MarkRuntimeStrides(const ResourceDiscoveryList& resources, Info& info) {
 
 void PatchBufferArgs(IR::Inst& inst, Info& info) {
     const auto handle = inst.Arg(0);
-    const auto& buffer_res = info.buffers[handle.U32()];
+    auto& buffer_res = info.buffers[handle.U32()];
     const auto buffer = buffer_res.GetSharp(info);
 
     // Address of constant buffer reads can be calculated at IR emission time.
     if (inst.GetOpcode() == IR::Opcode::ReadConstBuffer) {
         return;
     }
+
+    // Record before replacing the guest address operands. Atomics also read.
+    const auto access_info = inst.Flags<IR::BufferInstInfo>();
+    u32 bytes = 4;
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::LoadBufferU8: bytes = 1; break;
+    case IR::Opcode::LoadBufferU16: bytes = 2; break;
+    case IR::Opcode::BufferAtomicIAdd64:
+    case IR::Opcode::BufferAtomicSMax64:
+    case IR::Opcode::BufferAtomicSMin64:
+    case IR::Opcode::BufferAtomicUMax64:
+    case IR::Opcode::BufferAtomicUMin64:
+    case IR::Opcode::StoreBufferU64:
+    case IR::Opcode::LoadBufferU64:
+    case IR::Opcode::LoadBufferU32x2:
+    case IR::Opcode::LoadBufferF32x2: bytes = 8; break;
+    case IR::Opcode::LoadBufferU32x3:
+    case IR::Opcode::LoadBufferF32x3: bytes = 12; break;
+    case IR::Opcode::LoadBufferU32x4:
+    case IR::Opcode::LoadBufferF32x4: bytes = 16; break;
+    case IR::Opcode::LoadBufferFormatF32: {
+        const auto fmt = access_info.inst_data_fmt != AmdGpu::DataFormat::FormatInvalid
+            ? AmdGpu::RemapDataFormat(access_info.inst_data_fmt.Value()) : buffer.GetDataFmt();
+        bytes = (AmdGpu::NumBitsPerElement(fmt) + 7) / 8;
+        break;
+    }
+    default: break;
+    }
+    const auto scalar = IR::GetBufferSOffsetArg(&inst);
+    buffer_res.dynamic_read_offset |= access_info.voffset_enable || !scalar.IsImmediate();
+    buffer_res.read_offset_end = std::max<u64>(buffer_res.read_offset_end,
+        u64(access_info.inst_offset.Value()) + bytes + (scalar.IsImmediate() ? scalar.U32() : 0));
 
     const bool indexed = inst.Flags<IR::BufferInstInfo>().index_enable || buffer.add_tid_enable;
     const u32 stride_dword = buffer_res.runtime_stride && indexed ? buffer_res.sharp_fetch.offsets[1] : 0;
