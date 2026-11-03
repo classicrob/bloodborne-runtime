@@ -26,12 +26,6 @@ IR::Type BufferDataType(const IR::Inst& inst, const Profile& profile) {
     case IR::Opcode::LoadBufferU16:
     case IR::Opcode::StoreBufferU16:
         return IR::Type::U16;
-    case IR::Opcode::BufferAtomicIAdd64:
-    case IR::Opcode::BufferAtomicSMax64:
-    case IR::Opcode::BufferAtomicSMin64:
-    case IR::Opcode::BufferAtomicUMax64:
-    case IR::Opcode::BufferAtomicUMin64:
-    case IR::Opcode::StoreBufferU64:
     case IR::Opcode::LoadBufferU64:
     case IR::Opcode::StoreBufferU64:
     case IR::Opcode::BufferAtomicIAdd64:
@@ -60,12 +54,6 @@ u32 BufferAddressShift(const IR::Inst& inst, AmdGpu::DataFormat data_format) {
     case IR::Opcode::LoadBufferU16:
     case IR::Opcode::StoreBufferU16:
         return 1;
-    case IR::Opcode::BufferAtomicIAdd64:
-    case IR::Opcode::BufferAtomicSMax64:
-    case IR::Opcode::BufferAtomicSMin64:
-    case IR::Opcode::BufferAtomicUMax64:
-    case IR::Opcode::BufferAtomicUMin64:
-    case IR::Opcode::StoreBufferU64:
     case IR::Opcode::LoadBufferU64:
     case IR::Opcode::StoreBufferU64:
     case IR::Opcode::BufferAtomicIAdd64:

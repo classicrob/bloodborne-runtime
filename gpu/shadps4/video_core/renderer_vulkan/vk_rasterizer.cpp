@@ -3,6 +3,7 @@
 
 #include <dlfcn.h>
 #include <chrono>
+#include <mutex>
 #include "shader_recompiler/buffer_read_extent.h"
 #include "bbport_metal_residency.h"
 #include <map>
@@ -3870,7 +3871,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     *buffer, offset_aligned,
                     std::min<u64>(size + adjust, buffer->SizeBytes() - offset_aligned)));
                 u64 read_offset = offset;
-                u64 declared_size = read_extent;
+                u64 declared_size = std::min<u64>(read_extent, buffer->SizeBytes() - offset);
                 const bool dynamic = vsharp.stride && desc.dynamic_read_offset;
                 if (dynamic) {
                     // Retain pre-PR #11 ordering coverage for unknown offsets. This is
@@ -3885,6 +3886,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     return value && value[0] == '1';
                 }();
                 if (count_extents) {
+                    static std::mutex extent_stats_mutex;
+                    const std::lock_guard lock(extent_stats_mutex);
                     static u64 static_count = 0, dynamic_count = 0, bindings = 0;
                     static auto since = std::chrono::steady_clock::now();
                     ++bindings;
