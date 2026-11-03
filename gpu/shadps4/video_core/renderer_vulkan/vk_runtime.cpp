@@ -957,6 +957,44 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+void Runtime::CopyImageLayer(VideoCore::Image* src, u32 src_layer, VideoCore::Image* dst,
+                             u32 dst_layer) {
+    const vk::ImageCopy image_copy{
+        .srcSubresource{
+            .aspectMask = src->aspect_mask,
+            .mipLevel = 0,
+            .baseArrayLayer = src_layer,
+            .layerCount = 1,
+        },
+        .dstSubresource{
+            .aspectMask = dst->aspect_mask,
+            .mipLevel = 0,
+            .baseArrayLayer = dst_layer,
+            .layerCount = 1,
+        },
+        .extent = {src->info.size.width, src->info.size.height, 1},
+    };
+    SetBackingSamples(dst, dst->info.num_samples);
+    SetBackingSamples(src, src->info.num_samples);
+    scheduler.EndRendering();
+    bool needs_flush =
+        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
+                vk::AccessFlagBits2::eTransferRead);
+    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
+                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+    if (needs_flush) {
+        FlushBarriers();
+    }
+    scheduler.Record([enc = encoder, src_image = src->GetImage(), dst_image = dst->GetImage(),
+                      image_copy](vk::CommandBuffer cmdbuf) {
+        enc->CopyImage(cmdbuf, src_image, dst_image, {&image_copy, 1},
+                       vk::ImageLayout::eTransferSrcOptimal,
+                       vk::ImageLayout::eTransferDstOptimal);
+    });
+    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
         if (instance.IsMaintenance8Supported() ||

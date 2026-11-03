@@ -463,6 +463,7 @@ private:
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline, bool dry_run = false);
     bool IsComputeImageClear(const Pipeline* pipeline);
+    bool IsComputeLayerCopy(const Pipeline* pipeline);
 
 private:
     friend class VideoCore::BufferCache;

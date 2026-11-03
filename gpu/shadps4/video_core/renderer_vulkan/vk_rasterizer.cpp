@@ -3104,6 +3104,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         const int which = !(hle_off & 1) && IsComputeImageCopy(pipeline)   ? 1
                           : !(hle_off & 2) && IsComputeMetaClear(pipeline) ? 2
                           : !(hle_off & 4) && IsComputeImageClear(pipeline) ? 3
+                          : !(hle_off & 8) && IsComputeLayerCopy(pipeline)  ? 1
                                                                              : 0;
         // bbport BB_CLEAR_HLE_DEBUG=<program hash>: which substitution that program got.
         static const u64 which_debug = [] {
@@ -3992,6 +3993,105 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
         return false;
     }
     runtime.CopyColorAndDepth(&src_image, &dst_image);
+    return true;
+}
+
+// bbport (experiment bit 25): the engine's copy of one layer of its moment shadow-map array into a
+// 2D scratch image, which a filter draw then reads to write the layer back (program a040875f, about
+// 30 a frame: each object's and cascade's shadow map). As a compute pass each copy costs a render ->
+// compute -> render switch; as an image copy (a Metal blit) a cheaper render -> blit -> render one.
+// Only the exact case: one read layer of a single-mip RG16F array and one written single-layer,
+// single-mip 2D image of the same format and size, the parameters (source offset, destination
+// offset, extent) 0, 0 and the images' size, and an 8x8 dispatch covering exactly that size. The
+// shader writes (r, g, 0, 0); a two-channel image keeps r and g, which a copy of the same format
+// reproduces bit for bit (16-bit floats survive the shader's float conversion unchanged).
+bool Rasterizer::IsComputeLayerCopy(const Pipeline* pipeline) {
+    static constexpr u64 LayerCopyProgram = 0xa040875full;
+    if (!BbToggle::Experiment(1ull << 25) || !pipeline->IsCompute()) {
+        return false;
+    }
+    const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
+    const auto& cs_pgm = CsRegs();
+    if (info.pgm_hash != LayerCopyProgram || info.images.size() != 2 ||
+        ShaderBufferCount(info) != 1 || cs_pgm.num_thread_x.full != 8 ||
+        cs_pgm.num_thread_y.full != 8 || cs_pgm.num_thread_z.full != 1 || cs_pgm.dim_z != 1) {
+        return false;
+    }
+    const Shader::ImageResource* read = nullptr;
+    const Shader::ImageResource* written = nullptr;
+    for (const auto& desc : info.images) {
+        (desc.is_written ? written : read) = &desc;
+    }
+    const Shader::BufferResource* params_desc = nullptr;
+    u32 params_index = 0;
+    for (u32 i = 0; i < info.buffers.size(); ++i) {
+        if (info.buffers[i].buffer_type == Shader::BufferType::Guest) {
+            params_desc = &info.buffers[i];
+            params_index = i;
+        }
+    }
+    if (!read || !written || !params_desc || params_desc->is_written) {
+        return false;
+    }
+    const AmdGpu::Buffer params = params_desc->GetSharp(info);
+    if (!params.base_address || params.GetSize() < 10 * sizeof(u32)) {
+        return false;
+    }
+    // The parameters the shader would read: the GPU command thread's copy in the constant ring
+    // when it made one (guest memory may hold a later constant dump by now), else guest memory,
+    // which the shader would read then too.
+    const RingBinding* ring =
+        num_ring_stages ? FindRingBinding(info, params_index) : nullptr;
+    if (ring && ring->size < 10 * sizeof(u32)) {
+        return false;
+    }
+    const auto* words = ring ? reinterpret_cast<const u32*>(constant_ring->Data(ring->offset))
+                             : reinterpret_cast<const u32*>(u64(params.base_address));
+    const u32 width = words[8], height = words[9];
+    if (words[0] != 0 || words[1] != 0 || words[4] != 0 || words[5] != 0 || width == 0 ||
+        height == 0 || cs_pgm.dim_x != (width + 7) / 8 || cs_pgm.dim_y != (height + 7) / 8) {
+        return false;
+    }
+    const AmdGpu::Image src_sharp = read->GetSharp(info);
+    const AmdGpu::Image dst_sharp = written->GetSharp(info);
+    if (src_sharp.base_array != src_sharp.last_array || src_sharp.base_level != 0 ||
+        src_sharp.last_level != 0 || dst_sharp.base_level != 0 || dst_sharp.last_level != 0 ||
+        src_sharp.GetDataFmt() != AmdGpu::DataFormat::Format16_16 ||
+        src_sharp.GetNumberFmt() != AmdGpu::NumberFormat::Float ||
+        dst_sharp.GetDataFmt() != src_sharp.GetDataFmt() ||
+        dst_sharp.GetNumberFmt() != src_sharp.GetNumberFmt() ||
+        src_sharp.width + 1 != width || src_sharp.height + 1 != height ||
+        dst_sharp.width + 1 != width || dst_sharp.height + 1 != height) {
+        return false;
+    }
+    // The images as the shader's own bindings would find them (FindTexture: refreshed, the
+    // written one marked GPU-modified).
+    VideoCore::TextureCache::ImageDesc src_desc{src_sharp, *read};
+    VideoCore::TextureCache::ImageDesc dst_desc{dst_sharp, *written};
+    const VideoCore::ImageId src_id = texture_cache.FindImage(src_desc);
+    const VideoCore::ImageId dst_id = texture_cache.FindImage(dst_desc);
+    if (!src_id || !dst_id || src_id == dst_id) {
+        return false;
+    }
+    VideoCore::Image& src = texture_cache.GetImage(src_id);
+    VideoCore::Image& dst = texture_cache.GetImage(dst_id);
+    const u32 layer = u32(src_sharp.base_array);
+    if (src.info.pixel_format != dst.info.pixel_format || src.info.props.is_depth ||
+        src.info.resources.levels != 1 || layer >= src.info.resources.layers ||
+        dst.info.resources.levels != 1 || dst.info.resources.layers != 1 ||
+        src.info.size.width != width || src.info.size.height != height ||
+        dst.info.size.width != width || dst.info.size.height != height ||
+        src.info.num_samples != 1 || dst.info.num_samples != 1) {
+        return false;
+    }
+    (void)texture_cache.FindTexture(src_id, src_desc);
+    (void)texture_cache.FindTexture(dst_id, dst_desc);
+    runtime.CopyImageLayer(&src, layer, &dst, 0);
+    static std::atomic<u64> layer_copies{0};
+    if (const u64 n = ++layer_copies; n == 1 || n % 4096 == 0) {
+        std::printf("Layer copies: %llu (shadow-map layer copies made image copies)\n",
+                    (unsigned long long)n);
+    }
     return true;
 }
 

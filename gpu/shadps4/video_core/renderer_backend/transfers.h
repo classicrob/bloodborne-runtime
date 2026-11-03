@@ -47,6 +47,8 @@ public:
 
     virtual void CopyImage(Image* src, Image* dst) = 0;
     virtual void CopyMip(Image* src, Image* dst, u32 mip, u32 slice) = 0;
+    /// bbport: level 0 of one layer of `src` into one layer of `dst` (same format and size).
+    virtual void CopyImageLayer(Image* src, u32 src_layer, Image* dst, u32 dst_layer) = 0;
     virtual void CopyColorAndDepth(Image* src, Image* dst) = 0;
     virtual void CopyDepthStencil(Image* src, Image* dst, const SubresourceRange& range) = 0;
     virtual void ResolveImage(Image* src, Image* dst, const SubresourceRange& src_range,
