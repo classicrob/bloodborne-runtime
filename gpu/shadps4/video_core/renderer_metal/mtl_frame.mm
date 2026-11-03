@@ -5,6 +5,8 @@
 #include <xxhash.h>
 #include <mach-o/dyld.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -309,6 +311,125 @@ void FenceNonrenderEnd(Encoder encoder) {
     [encoder updateFence:NonrenderFence()];
 }
 
+/// bbport BB_BLIT_MERGE_STATS=1 (measurement): how many blit encoders a barrier ended directly
+/// after another blit encoder, and how many of those pairs touch disjoint memory (no read or write
+/// of the second overlaps a write of the first, no write of the second overlaps a read of the
+/// first), i.e. could have been one encoder. Buffers are keyed by their CPU address when they have
+/// one (the pool's windows overlap), else by the buffer; textures by slice and level.
+namespace BlitMerge {
+struct Access {
+    std::uintptr_t key;
+    u64 begin, end;
+    bool write;
+};
+struct State {
+    const Owned* owner{};
+    std::vector<Access> current, previous;
+    bool previous_valid{}, pair{}, conflict{};
+};
+thread_local State state;
+std::atomic<u64> encoders{0}, pairs{0}, mergeable{0};
+bool On() {
+    static const bool on = std::getenv("BB_BLIT_MERGE_STATS") != nullptr;
+    return on;
+}
+State& Of(Owned& o) {
+    if (state.owner != &o) {
+        state = State{};
+        state.owner = &o;
+    }
+    return state;
+}
+void Report() {
+    static std::atomic<s64> last{0};
+    const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 seen = last.load(std::memory_order_relaxed);
+    if (now - seen >= 5 && last.compare_exchange_strong(seen, now)) {
+        std::printf("Blit merge (5 s): %llu blit encoders, %llu directly after a barrier-ended blit "
+                    "encoder, %llu of them disjoint (mergeable)\n",
+                    (unsigned long long)encoders.exchange(0), (unsigned long long)pairs.exchange(0),
+                    (unsigned long long)mergeable.exchange(0));
+    }
+}
+void Note(Owned& o, std::uintptr_t key, u64 begin, u64 end, bool write) {
+    if (!On()) {
+        return;
+    }
+    State& st = Of(o);
+    if (st.pair && !st.conflict) {
+        for (const Access& a : st.previous) {
+            if (a.key == key && a.begin < end && begin < a.end && (write || a.write)) {
+                st.conflict = true;
+                break;
+            }
+        }
+    }
+    st.current.push_back({key, begin, end, write});
+}
+void NoteBuffer(Owned& o, id<MTLBuffer> buffer, u64 offset, u64 size, bool write) {
+    void* contents = buffer.storageMode == MTLStorageModePrivate ? nullptr : buffer.contents;
+    if (contents) {
+        Note(o, 1, std::uintptr_t(contents) + offset, std::uintptr_t(contents) + offset + size,
+             write);
+    } else {
+        Note(o, std::uintptr_t((__bridge void*)buffer), offset, offset + size, write);
+    }
+}
+void NoteTexture(Owned& o, id<MTLTexture> texture, u32 slice, u32 level, bool write) {
+    // A view shares its parent's memory.
+    id<MTLTexture> base = texture.parentTexture ? texture.parentTexture : texture;
+    const u64 at = texture.parentTexture ? 0 : u64(slice) * 64 + level;
+    const u64 end = texture.parentTexture ? ~0ull : at + 1;
+    Note(o, std::uintptr_t((__bridge void*)base), at, end, write);
+}
+void Tally(State& st) {
+    if (st.pair) {
+        pairs.fetch_add(1, std::memory_order_relaxed);
+        if (!st.conflict) {
+            mergeable.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    st.pair = false;
+}
+/// A new blit encoder.
+void Opened(Owned& o) {
+    if (!On()) {
+        return;
+    }
+    State& st = Of(o);
+    encoders.fetch_add(1, std::memory_order_relaxed);
+    st.pair = st.previous_valid;
+    st.conflict = false;
+    st.current.clear();
+    Report();
+}
+/// The blit encoder ended by a barrier: the next blit encoder, if it comes directly, is a pair.
+void EndedByBarrier(Owned& o) {
+    if (!On()) {
+        return;
+    }
+    State& st = Of(o);
+    Tally(st);
+    st.previous = std::move(st.current);
+    st.current.clear();
+    st.previous_valid = true;
+}
+/// Any other encoder change: no pair.
+void Break(Owned& o) {
+    if (!On()) {
+        return;
+    }
+    State& st = Of(o);
+    if (o.blit) {
+        Tally(st);
+    }
+    st.previous_valid = false;
+    st.previous.clear();
+}
+} // namespace BlitMerge
+
 /// The render encoder of the current pass, opened on first use: a pass without draws costs
 /// nothing unless it clears (EndRendering), and work before its first draw (tessellation
 /// kernels) goes before it instead of splitting it.
@@ -332,6 +453,7 @@ id<MTLRenderCommandEncoder> RenderEncoder(Owned& o) {
     }
     MTLRenderPassDescriptor* descriptor = o.pass_opened ? o.pass : o.pass_first;
     MetalGpuTiming::AttachRender(o.timing, descriptor, "pass");
+    BlitMerge::Break(o);
     o.render = [o.cmd renderCommandEncoderWithDescriptor:descriptor];
     MetalGpuTiming::DetachRender(descriptor);
     o.pass_opened = true;
@@ -351,6 +473,7 @@ id<MTLComputeCommandEncoder> ComputeEncoder(Owned& o) {
         return o.compute;
     }
     EndEncoders(o);
+    BlitMerge::Break(o);
     if (MTLComputePassDescriptor* timed = MetalGpuTiming::ComputePass(o.timing)) {
         o.compute = [o.cmd computeCommandEncoderWithDescriptor:timed]; // BB_METAL_GPU_TIMING
     } else {
@@ -376,6 +499,7 @@ id<MTLBlitCommandEncoder> BlitEncoder(Owned& o) {
     if (Fenced()) {
         FenceNonrenderStart(o, o.blit);
     }
+    BlitMerge::Opened(o);
     return o.blit;
 }
 
@@ -772,6 +896,10 @@ void BufferImageCopy(Owned& o, BufferRef buffer, id<MTLTexture> texture,
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
     for (u32 layer = 0; layer < r.imageSubresource.layerCount; ++layer) {
         const u64 offset = buffer.offset + r.bufferOffset + layer * bytes_per_image;
+        BlitMerge::NoteBuffer(o, buffer.buffer, offset, bytes_per_image * r.imageExtent.depth,
+                              !to_image);
+        BlitMerge::NoteTexture(o, texture, r.imageSubresource.baseArrayLayer + layer,
+                               r.imageSubresource.mipLevel, to_image);
         if (to_image) {
             [blit copyFromBuffer:buffer.buffer
                        sourceOffset:offset
@@ -861,6 +989,9 @@ void Init(VkDevice dev, id<MTLCommandQueue> q, PFN_vkExportMetalObjectsEXT expor
 
 void EndEncoders(Owned& o) {
     FlushPending(o);
+    if (o.render || o.compute || o.blit) {
+        BlitMerge::Break(o);
+    }
     if (o.render) {
         if (Fenced()) {
             FenceRenderEnd(o);
@@ -1204,6 +1335,7 @@ void Barrier(Owned& o) {
         o.compute = nil;
     }
     if (o.blit) {
+        BlitMerge::EndedByBarrier(o);
         if (Fenced()) {
             FenceNonrenderEnd(o.blit);
         }
@@ -2059,6 +2191,8 @@ void CopyBuffer(Owned& o, VkBuffer src, VkBuffer dst, u32 count, const VkBufferC
     if (BufferAsCompute(o, s.buffer, s.offset, d.buffer, d.offset, count, regions, 0)) return;
     id<MTLBlitCommandEncoder> blit = BlitEncoder(o);
     for (u32 i = 0; i < count; ++i) {
+        BlitMerge::NoteBuffer(o, s.buffer, s.offset + regions[i].srcOffset, regions[i].size, false);
+        BlitMerge::NoteBuffer(o, d.buffer, d.offset + regions[i].dstOffset, regions[i].size, true);
         [blit copyFromBuffer:s.buffer
                  sourceOffset:s.offset + regions[i].srcOffset
                      toBuffer:d.buffer
@@ -2079,7 +2213,9 @@ void FillBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, 
     const u64 length = size == VK_WHOLE_SIZE ? d.buffer.length - d.offset - offset : size;
     const VkBufferCopy region{0, 0, length};
     if (BufferAsCompute(o, nil, 0, d.buffer, d.offset + offset, 1, &region, b)) return;
-    [BlitEncoder(o) fillBuffer:d.buffer range:NSMakeRange(d.offset + offset, length) value:b];
+    id<MTLBlitCommandEncoder> fill = BlitEncoder(o);
+    BlitMerge::NoteBuffer(o, d.buffer, d.offset + offset, length, true);
+    [fill fillBuffer:d.buffer range:NSMakeRange(d.offset + offset, length) value:b];
 }
 
 void UpdateBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size,
@@ -2094,7 +2230,9 @@ void UpdateBuffer(Owned& o, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size
     o.keep.push_back(staging); // the command buffer does not retain it
     const VkBufferCopy region{0, 0, size};
     if (BufferAsCompute(o, staging, 0, d.buffer, d.offset + offset, 1, &region, 0)) return;
-    [BlitEncoder(o) copyFromBuffer:staging
+    id<MTLBlitCommandEncoder> update = BlitEncoder(o);
+    BlitMerge::NoteBuffer(o, d.buffer, d.offset + offset, size, true);
+    [update copyFromBuffer:staging
                       sourceOffset:0
                           toBuffer:d.buffer
                  destinationOffset:d.offset + offset
@@ -2110,6 +2248,10 @@ void CopyImage(Owned& o, VkImage src, VkImage dst, u32 count, const VkImageCopy*
     for (u32 i = 0; i < count; ++i) {
         const VkImageCopy& r = regions[i];
         for (u32 layer = 0; layer < r.srcSubresource.layerCount; ++layer) {
+            BlitMerge::NoteTexture(o, s, r.srcSubresource.baseArrayLayer + layer,
+                                   r.srcSubresource.mipLevel, false);
+            BlitMerge::NoteTexture(o, d, r.dstSubresource.baseArrayLayer + layer,
+                                   r.dstSubresource.mipLevel, true);
             [blit copyFromTexture:s
                       sourceSlice:r.srcSubresource.baseArrayLayer + layer
                       sourceLevel:r.srcSubresource.mipLevel
@@ -2185,6 +2327,7 @@ void ClearColorImage(Owned& o, VkImage image, const VkClearColorValue* color, u3
         rp.colorAttachments[0].clearColor = MTLClearColorMake(
             color->float32[0], color->float32[1], color->float32[2], color->float32[3]);
         MetalGpuTiming::AttachRender(o.timing, rp, "clear");
+        BlitMerge::Break(o);
         [[o.cmd renderCommandEncoderWithDescriptor:rp] endEncoding];
     });
 }
@@ -2216,6 +2359,7 @@ void ClearDepthStencilImage(Owned& o, VkImage image, const VkClearDepthStencilVa
             rp.stencilAttachment.clearStencil = value->stencil;
         }
         MetalGpuTiming::AttachRender(o.timing, rp, "clear");
+        BlitMerge::Break(o);
         [[o.cmd renderCommandEncoderWithDescriptor:rp] endEncoding];
     });
 }
@@ -2333,6 +2477,7 @@ void BlitImage(Owned& o, VkImage src_image, VkImage dst_image, u32 count,
             rp.stencilAttachment.storeAction = MTLStoreActionStore;
         }
         MetalGpuTiming::AttachRender(o.timing, rp, "copy draw");
+        BlitMerge::Break(o);
         id<MTLRenderCommandEncoder> enc = [o.cmd renderCommandEncoderWithDescriptor:rp];
         MetalGpuTiming::NoteWork(o.timing);
         [enc setRenderPipelineState:pipeline];
